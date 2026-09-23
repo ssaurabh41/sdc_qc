@@ -15,8 +15,8 @@ licence-free check you run each time a new SDC arrives.
 * Single file, standard library only: `sdc_qc.py`. It needs Python 3.6.2 or
   later with `tkinter`, which provides the Tcl interpreter; no Tk display is
   needed.
-* `run.sh` is a tcsh wrapper with the run command and its usage in the header
-  comments.
+* `run.sh` (tcsh) and `run.bat` (Windows) are wrappers with the run command
+  and its usage in the header comments.
 * `tests/` holds unit and regression tests, a small demo design with seeded
   SDC faults, and a clean 544-instance multi-clock benchmark.
 
@@ -26,7 +26,18 @@ licence-free check you run each time a new SDC arrives.
 ./run.sh                   # runs the demo in tests/data; edit SETTINGS in run.sh for your block
 ```
 
-or directly:
+On Windows (cmd.exe or PowerShell), with Python from python.org, which
+includes tkinter:
+
+```bat
+run.bat                    & rem same demo; edit SETTINGS in run.bat for your block
+py -3 sdc_qc.py -netlist foo.v -lib std.lib -mode "func:D:\sdc\foo.sdc"
+```
+
+On Windows, Liberty files still parse in parallel. Netlist elaboration and
+modes run serially, because Windows has no `fork`.
+
+Or directly:
 
 ```tcsh
 python3 sdc_qc.py \
