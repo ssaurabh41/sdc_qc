@@ -1,0 +1,125 @@
+/* Synthetic CCS/LVF-style library for sdc_qc tests. Braces in this header
+   comment would break naive parsers: none here on purpose */
+library (tcells) {
+  delay_model : table_lookup;
+  time_unit : "1ns";
+  voltage_unit : "1V";
+  capacitive_load_unit (1, pf);
+  lu_table_template (tmpl_2x2) {
+    variable_1 : input_net_transition;
+    variable_2 : total_output_net_capacitance;
+    index_1 ("0.01, 0.1");
+    index_2 ("0.001, 0.01");
+  }
+  output_current_template (ccs_tmpl) {
+    variable_1 : input_net_transition;
+    variable_2 : total_output_net_capacitance;
+    variable_3 : time;
+  }
+  type (bus4) { base_type : array; data_type : bit; bit_width : 4; bit_from : 3; bit_to : 0; downto : true; }
+  type (bus8) { base_type : array; data_type : bit; bit_width : 8; bit_from : 7; bit_to : 0; downto : true; }
+  cell (INVX1) {
+    area : 1.0;
+    pg_pin (VDD) { voltage_name : VDD; pg_type : primary_power; }
+    pg_pin (VSS) { voltage_name : VSS; pg_type : primary_ground; }
+    leakage_power () { value : 0.1; }
+    pin (A) { direction : input; capacitance : 0.001;
+      receiver_capacitance () { receiver_capacitance1_rise (tmpl_2x2) { values ("1, 2", "3, 4"); } }
+    }
+    pin (Y) { direction : output; function : "!A";
+      timing () {
+        related_pin : "A";
+        timing_sense : negative_unate;
+        cell_rise (tmpl_2x2) { index_1 ("0.01, 0.1"); values ("0.1, 0.2", \
+                   "0.3, 0.4"); }
+        output_current_rise () {
+          vector (ccs_tmpl) { reference_time : 0.01; index_1 ("0.01"); index_2 ("0.001"); index_3 ("0.1, 0.2"); values ("0.1, 0.2"); }
+          vector (ccs_tmpl) { reference_time : 0.01; index_1 ("0.1"); index_2 ("0.001"); index_3 ("0.1, 0.2"); values ("0.1, 0.2"); }
+        }
+        ocv_sigma_cell_rise (tmpl_2x2) { sigma_type : early; values ("0.01, 0.02", "0.03, 0.04"); }
+        ocv_sigma_cell_rise (tmpl_2x2) { sigma_type : late; values ("0.01, 0.02", "0.03, 0.04"); }
+      }
+      internal_power () { related_pin : "A"; rise_power (tmpl_2x2) { values ("1, 2", "3, 4"); } }
+    }
+  }
+  cell (BUFX2) {
+    pin (A) { direction : input; }
+    pin (Y) { direction : output; function : "A";
+      timing () { related_pin : "A"; cell_rise (tmpl_2x2) { values ("1, 2", "3, 4"); } }
+    }
+  }
+  cell (AND2X1) {
+    pin (A1, A2) { direction : input; }
+    pin (Y) { direction : output; function : "(A1 A2)";
+      timing () { related_pin : "A1"; }
+      timing () { related_pin : "A2"; }
+    }
+  }
+  cell (MUX2X1) {
+    pin (A) { direction : input; }
+    pin (B) { direction : input; }
+    pin (S) { direction : input; }
+    pin (Y) { direction : output; function : "(A !S) + (B S)";
+      timing () { related_pin : "A B S"; }
+    }
+  }
+  cell (DFFX1) {
+    ff (IQ, IQN) { next_state : "D"; clocked_on : "CK"; }
+    pin (CK) { direction : input; clock : true; }
+    pin (D) { direction : input;
+      timing () { related_pin : "CK"; timing_type : setup_rising; rise_constraint (tmpl_2x2) { values ("1, 2", "3, 4"); } }
+      timing () { related_pin : "CK"; timing_type : hold_rising; rise_constraint (tmpl_2x2) { values ("1, 2", "3, 4"); } }
+    }
+    pin (Q) { direction : output; function : "IQ";
+      timing () { related_pin : "CK"; timing_type : rising_edge; cell_rise (tmpl_2x2) { values ("1, 2", "3, 4"); } }
+    }
+    test_cell () {
+      ff (IQ, IQN) { next_state : "D"; clocked_on : "CK"; }
+      pin (D) { direction : input; signal_type : test_scan_in; }
+    }
+  }
+  cell (LATX1) {
+    latch (IQ, IQN) { data_in : "D"; enable : "G"; }
+    pin (G) { direction : input; }
+    pin (D) { direction : input;
+      timing () { related_pin : "G"; timing_type : setup_falling; }
+    }
+    pin (Q) { direction : output; function : "IQ";
+      timing () { related_pin : "G"; timing_type : rising_edge; }
+      timing () { related_pin : "D"; }
+    }
+  }
+  cell (ICGX1) {
+    clock_gating_integrated_cell : "latch_posedge";
+    statetable ("CK E", "IQ") { table : "L L : - : L, L H : - : H, H - : - : N"; }
+    pin (CK) { direction : input; clock_gate_clock_pin : true; clock : true; }
+    pin (E) { direction : input; clock_gate_enable_pin : true;
+      timing () { related_pin : "CK"; timing_type : setup_rising; }
+    }
+    pin (GCLK) { direction : output; clock_gate_out_pin : true; function : "CK IQ";
+      timing () { related_pin : "CK"; timing_sense : positive_unate; }
+    }
+  }
+  cell (SRAM16X8) {
+    is_macro_cell : true;
+    memory () { type : ram; address_width : 4; word_width : 8; }
+    pin (CLK) { direction : input; clock : true; }
+    pin (CEN) { direction : input;
+      timing () { related_pin : "CLK"; timing_type : setup_rising; }
+      timing () { related_pin : "CLK"; timing_type : hold_rising; }
+    }
+    bus (A) { bus_type : bus4; direction : input;
+      timing () { related_pin : "CLK"; timing_type : setup_rising; }
+      timing () { related_pin : "CLK"; timing_type : hold_rising; }
+    }
+    bus (D) { bus_type : bus8; direction : input;
+      pin (D[7:0]) { timing () { related_pin : "CLK"; timing_type : setup_rising; } }
+    }
+    bus (Q) { bus_type : bus8; direction : output;
+      timing () { related_pin : "CLK"; timing_type : rising_edge; }
+    }
+  }
+  cell (TIELO) {
+    pin (Y) { direction : output; function : "0"; }
+  }
+}
