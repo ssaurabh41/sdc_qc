@@ -17,8 +17,8 @@ licence-free check you run each time a new SDC arrives.
   needed.
 * `run.sh` is a tcsh wrapper with the run command and its usage in the header
   comments.
-* `tests/` holds unit and regression tests, plus a small demo design with
-  seeded SDC faults.
+* `tests/` holds unit and regression tests, a small demo design with seeded
+  SDC faults, and a clean 544-instance multi-clock benchmark.
 
 ## Quick start
 
@@ -180,8 +180,11 @@ SRAMs and hard macros therefore get the same treatment as flip-flops.
 
 ## Performance
 
-Measured on a 4-core VM with a synthetic flat DC-style netlist of 2,000,065
-instances (180 MB) and four CCS-like libraries of 487 MB each:
+One-time scale measurement on a 4-core VM with a synthetic flat DC-style
+netlist of 2,000,065 instances (180 MB) and four CCS-like libraries of 487 MB
+each. That large benchmark is not in the repo. Day-to-day runtime and
+false-positive checks use the small benchmark described under Tests, which
+runs in under a second:
 
 | Stage | `-jobs 1` | `-jobs 4` |
 |---|---|---|
@@ -289,3 +292,4 @@ python3 tests/test_sdc_qc.py -v
 * Mode and variable sequencing, and every seeded fault in the demo SDCs.
 * Equality of the serial and parallel paths, for both netlist elaboration
   and modes.
+* The clean benchmark: zero findings and every clock pin reached.
