@@ -307,6 +307,18 @@ class EngineUnitTests(unittest.TestCase):
         self.assertEqual([f.obj for f in e.findings if f.rule == "OBJ-001"], ["nope9"])
 
 
+class BenchTests(unittest.TestCase):
+    """544-instance, 6-clock design (generated clock, clock mux) with a clean SDC:
+    guards against false positives. Must stay at zero findings."""
+
+    def test_clean_benchmark(self):
+        rc, res = run(["func:%s" % D("bench.sdc")], netlists=("bench.v",))
+        self.assertEqual(rc, 0)
+        self.assertEqual([(f["rule"], f["msg"]) for f in res["findings"]], [])
+        cov = res["summary"]["modes"][0]["coverage"]
+        self.assertEqual(cov["clocked"], cov["total"])
+
+
 class ParallelTests(unittest.TestCase):
     """The parallel paths (forked elaboration workers, parallel modes/libs) must
     give exactly the serial result."""

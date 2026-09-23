@@ -263,11 +263,19 @@ These are deliberate simplifications. Challenge any that do not match your flow.
 
 ## Tests
 
+`tests/data/bench.v` + `bench.sdc` is a small benchmark: 544 instances, 6 clocks
+(including a divider-generated clock and a clock mux), and a clean SDC that must
+produce zero findings. Use it for quick runtime and false-positive checks:
+
+```tcsh
+python3 sdc_qc.py -netlist tests/data/bench.v -lib tests/data/cells.lib -mode "func:tests/data/bench.sdc"
+```
+
 ```tcsh
 python3 tests/test_sdc_qc.py -v
 ```
 
-27 tests cover:
+28 tests cover:
 
 * Liberty extraction, including CCS/LVF groups, `test_cell`, buses,
   multi-name pins, gzip, a 7-byte read chunk that exercises every
