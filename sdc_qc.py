@@ -26,6 +26,7 @@ import concurrent.futures
 import gzip
 import hashlib
 import json
+import math
 import os
 import pickle
 import re
@@ -1927,6 +1928,9 @@ SDC_CMDS = {
     "set_max_area": _spec("-ignore_tns", {}, (1, None, False)),
 }
 
+# Commands whose positional value is not a number
+_NON_NUMERIC_VALUE = set(["set_case_analysis", "set_hierarchy_separator", "set_wire_load_mode"])
+
 # Commands whose clock arguments do not count as "using" a (virtual) clock
 _NOT_CLOCK_REFS = set("""set_propagated_clock set_clock_transition set_max_transition
 set_max_capacitance set_dont_touch_network create_clock""".split())
@@ -1948,23 +1952,18 @@ set_timing_derate_mode set_min_library set_disable_clock_gating_check set_annota
 set_annotated_check set_annotated_transition read_parasitics set_input_parasitics
 """.split())
 
-_TCL_SETUP = r"""
-foreach __qc_c {exec socket cd load exit} { catch {rename $__qc_c {}} }
-rename open __qc_tcl_open
-proc open {name {mode r} args} {
-    if {$mode ne "r" && $mode ne "RDONLY"} { error "sdc_qc sandbox: open for writing is disabled" }
-    return [__qc_tcl_open $name r]
-}
-rename file __qc_tcl_file
-proc file {sub args} {
-    set ok {exists isfile isdirectory dirname tail rootname extension join normalize split readable nativename pathtype}
+# Master-side helper exposed to the SDC as 'file': path-string subcommands only
+_TCL_MASTER_SETUP = r"""
+proc __qc_file_safe {sub args} {
+    set ok {dirname tail rootname extension join split normalize nativename pathtype}
     if {[lsearch -exact $ok $sub] < 0} { error "sdc_qc sandbox: 'file $sub' is disabled" }
-    return [__qc_tcl_file $sub {*}$args]
+    return [file $sub {*}$args]
 }
+"""
+
+_TCL_SETUP = r"""
 proc exit args { error "exit called in SDC" }
-rename puts __qc_tcl_puts
 proc puts args { return "" }
-rename source __qc_tcl_source
 proc __qc_run {__qc_lvl __qc_s} {
     set __qc_c [catch {uplevel #$__qc_lvl $__qc_s} __qc_m __qc_o]
     if {$__qc_c == 1} { return [list 1 $__qc_m [dict get $__qc_o -errorinfo]] }
@@ -2046,11 +2045,21 @@ class ModeState(object):
         self.seconds = 0.0
 
 
-def _num(s):
+def _is_float(s):
     try:
-        return float(s)
+        float(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _num(s):
+    """Finite float or None (rejects NaN/Inf: never valid timing values)."""
+    try:
+        v = float(s)
     except (TypeError, ValueError):
         return None
+    return v if math.isfinite(v) else None
 
 
 class SdcEngine(object):
@@ -2074,9 +2083,20 @@ class SdcEngine(object):
         self._setup_tcl()
 
     # ------------------------------------------------------------------ infra
+    def sdc_eval(self, script):
+        """Evaluate a script in the sandboxed child interpreter that runs the SDC."""
+        return self.tcl.call("interp", "eval", "sdc", script)
+
     def _setup_tcl(self):
+        # The SDC runs in a Tcl *safe* child interpreter: open/file/exec/socket/
+        # cd/load/source/glob are hidden there and cannot be reached from the
+        # SDC (a safe interp cannot invoke its hidden commands). Python
+        # commands live in the master and are exposed through aliases.
         t = self.tcl
-        t.eval(_TCL_SETUP)
+        t.call("interp", "create", "-safe", "sdc")
+        t.eval(_TCL_MASTER_SETUP)
+        t.call("interp", "alias", "sdc", "file", "", "__qc_file_safe")
+        self.sdc_eval(_TCL_SETUP)
         py = {
             "get_ports": self.c_get_ports, "get_pins": self.c_get_pins,
             "get_cells": self.c_get_cells, "get_nets": self.c_get_nets,
@@ -2101,13 +2121,17 @@ class SdcEngine(object):
         for name in NOOP_CMDS:
             if name not in py:
                 py[name] = (lambda n: lambda frame, *a: self.c_noop(n, frame, a))(name)
+        py["source_lvl"] = self.c_source
         for name, fn in py.items():
             t.createcommand("__py_" + name, self._guard(name, fn))
-            # Wrapper passes the caller's frame for file:line attribution
-            t.eval("proc %s args { __py_%s [info frame -1] {*}$args }" % (name, name))
+            t.call("interp", "alias", "sdc", "__py_" + name, "", "__py_" + name)
+            if name != "source_lvl":
+                # Wrapper passes the caller's frame for file:line attribution
+                self.sdc_eval("proc %s args { __py_%s [info frame -1] {*}$args }" % (name, name))
         t.createcommand("__qc_split", self.c_split)
-        t.eval("proc source args { __py_source_lvl [info frame -1] [expr {[info level]-1}] {*}$args }")
-        t.createcommand("__py_source_lvl", self.c_source)
+        t.call("interp", "alias", "sdc", "__qc_split", "", "__qc_split")
+        self.sdc_eval("proc source args { __py_source_lvl [info frame -1] "
+                      "[expr {[info level]-1}] {*}$args }")
 
     def _guard(self, name, fn):
         def run(*a):
@@ -2174,7 +2198,7 @@ class SdcEngine(object):
         i = 0
         while i < len(args):
             a = args[i]
-            if a.startswith("-") and len(a) > 1 and _num(a) is None:
+            if a.startswith("-") and len(a) > 1 and not _is_float(a):
                 name = a if a in flags or a in vals else None
                 if name is None:
                     cands = [n for n in names if n.startswith(a)]
@@ -2915,7 +2939,7 @@ class SdcEngine(object):
                     continue
                 buf = []
                 frame[2] = start
-                res = t.splitlist(t.call("__qc_run", lvl, chunk))
+                res = t.splitlist(self.sdc_eval(t.call("list", "__qc_run", lvl, chunk)))
                 code = int(res[0])
                 if code == 1:
                     msg = str(res[1])
@@ -2943,6 +2967,14 @@ class SdcEngine(object):
             self.add("PARSE-003", "%s: missing value argument" % name, loc)
             return ""
         rest = pos[nval:]
+        bad = []
+        if nval and name not in _NON_NUMERIC_VALUE and name not in ("set_input_delay",
+                                                                     "set_output_delay"):
+            bad.extend(v for v in values if _num(v) is None)
+        bad.extend(v for o, v in opts.items()
+                   if spec["vals"].get(o) == "num" and o != "-period" and _num(v) is None)
+        for v in bad:
+            self.add("PARSE-003", "%s: '%s' is not a finite number" % (name, v), loc)
         rec = {"cmd": name, "opts": opts, "values": values, "loc": loc, "objs": [],
                "approx": False, "dropped": False}
         # resolve object-valued options
@@ -3278,7 +3310,7 @@ class SdcEngine(object):
         t0 = time.time()
         for kind, a, b in steps:
             if kind == "var":
-                self.tcl.call("set", "::" + a, b)
+                self.sdc_eval(self.tcl.call("list", "set", "::" + a, b))
             else:
                 p = self.find_file(a)
                 if p is None:

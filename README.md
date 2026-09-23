@@ -184,9 +184,16 @@ SRAMs and hard macros therefore get the same treatment as flip-flops.
     base name matches all its bits.
   * `-hierarchical` matches the pattern against every trailing part of the
     full name that starts after a `/`.
-* **Sandbox:** the SDC comes from another team, so `exec`, `socket`, `cd`,
-  `load`, `exit`, file writes and destructive `file` subcommands are disabled.
-  `puts` is silenced.
+* **Sandbox:** the SDC comes from another team, so it runs in a Tcl *safe*
+  child interpreter.
+  * `open`, `glob`, `exec`, `socket`, `cd` and `load` are not available.
+    The SDC cannot reach them in any way, including `interp invokehidden`.
+  * `file` is limited to path-string subcommands such as `dirname`, `tail`
+    and `join`.
+  * `source` is handled by sdc_qc, `exit` is an error, and `puts` is silenced.
+* **Numbers:** `NaN`/`Inf` are rejected wherever a number is expected. Invalid
+  periods, waveforms and generated-clock ratios report CLK-003/004/009; other
+  values report PARSE-003.
 * **Line numbers:** Tcl `info frame` gives the exact line for commands at the
   top level of a file, inside `if`/`foreach`/`for` bodies and inside called
   procs (reported at the call site). Inside a `foreach_in_collection` body, the

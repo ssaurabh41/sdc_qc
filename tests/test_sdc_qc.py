@@ -221,7 +221,7 @@ class EngineUnitTests(unittest.TestCase):
         return e
 
     def ev(self, e, cmd):
-        return e.tcl.eval(cmd)
+        return e.sdc_eval(cmd)
 
     def test_patterns(self):
         e = self.eng("")
@@ -289,8 +289,35 @@ class EngineUnitTests(unittest.TestCase):
                          ["u_core/q_reg/D"])
 
     def test_sandbox(self):
-        e = self.eng("exec rm -rf /tmp/x\nset f [open /tmp/sdcqc_x w]\n")
-        self.assertEqual(sum(1 for f in e.findings if f.rule in ("PARSE-001", "PARSE-002")), 2)
+        tmp = tempfile.mkdtemp()
+        try:
+            keep = os.path.join(tmp, "keep").replace("\\", "/")
+            new = os.path.join(tmp, "new").replace("\\", "/")
+            open(keep, "w").close()
+            cmds = ["exec rm -rf %s" % keep, "set f [open %s w]" % new,
+                    "set f [__qc_tcl_open %s w]" % new, "__qc_tcl_file delete %s" % keep,
+                    "__qc_tcl_puts stdout x", "interp invokehidden {} open %s w" % new,
+                    "file delete %s" % keep, "glob %s/*" % tmp]
+            e = self.eng("\n".join(cmds) + "\n")
+            self.assertEqual(sum(1 for f in e.findings
+                                 if f.rule in ("PARSE-001", "PARSE-002")), len(cmds))
+            self.assertTrue(os.path.exists(keep))
+            self.assertFalse(os.path.exists(new))
+            self.assertEqual(self.ev(e, "file tail a/b.sdc"), "b.sdc")   # path helpers kept
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_non_finite_numbers(self):
+        e = self.eng("create_clock -name C -period NaN [get_ports clk]\n"
+                     "set_clock_uncertainty Inf [get_ports clk]\n"
+                     "set_multicycle_path -Inf -to [get_pins u_core/q_reg/D]\n"
+                     "set_input_delay -clock C NaN [get_ports a]\n"
+                     "create_generated_clock -name G -source [get_ports clk] -divide_by Inf "
+                     "[get_pins u_core/div_reg/Q]\n")
+        r = sorted((f.rule, f.line) for f in e.findings if f.rule in ("CLK-003", "PARSE-003",
+                                                                       "CLK-009"))
+        self.assertEqual(r, [("CLK-003", 1), ("CLK-009", 5), ("PARSE-003", 2), ("PARSE-003", 3),
+                             ("PARSE-003", 4), ("PARSE-003", 5)])
 
     def test_generated_clock_checks(self):
         e = self.eng("create_clock -name C -period 2 [get_ports clk]\n"
