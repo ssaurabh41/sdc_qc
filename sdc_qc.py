@@ -3821,6 +3821,29 @@ def write_reports(out_dir, findings, summary):
         os.makedirs(out_dir)
     findings = sorted(findings, key=lambda f: (f.mode != "*", f.mode, _SEV_RANK[f.sev], f.rule,
                                                f.file, f.line))
+
+    # Short labels for SDC files in the .rpt body: basename, disambiguated with
+    # parent directories only when two files share a basename.
+    all_files = sorted(set(f.file for f in findings if f.file) |
+                       set(p for m in summary["modes"] for p in m["files"]))
+    short_name = {}
+    by_base = collections.defaultdict(list)
+    for p in all_files:
+        by_base[os.path.basename(p)].append(p)
+    for base, paths in by_base.items():
+        if len(paths) == 1:
+            short_name[paths[0]] = base
+        else:
+            parts = [p.split(os.sep) for p in paths]
+            n = 1
+            while n < max(len(p) for p in parts):
+                tails = [os.sep.join(p[-n - 1:]) for p in parts]
+                if len(set(tails)) == len(tails):
+                    break
+                n += 1
+            for p, tail in zip(paths, [os.sep.join(p[-n - 1:]) for p in parts]):
+                short_name[p] = tail
+
     import csv
     with open(os.path.join(out_dir, "sdc_qc.csv"), "w") as fh:
         w = csv.writer(fh)
@@ -3837,11 +3860,17 @@ def write_reports(out_dir, findings, summary):
     L.append("Liberty time unit: %s   capacitance unit: %s" % (summary["time_unit"],
                                                              summary["cap_unit"]))
     for m in summary["modes"]:
-        L.append("Mode %-16s clocks=%-4d files: %s" % (m["name"], m["clocks"], " ".join(m["files"])))
+        L.append("Mode %-16s clocks=%-4d files: %s" % (
+            m["name"], m["clocks"], " ".join(short_name.get(p, p) for p in m["files"])))
         if m.get("coverage"):
             cv = m["coverage"]
             L.append("     clock pins reached by a clock: %d / %d" % (cv["clocked"], cv["total"]))
     L.append("")
+    if short_name:
+        L.append("Files")
+        for p in sorted(short_name, key=lambda p: short_name[p]):
+            L.append("  %-30s %s" % (short_name[p], p))
+        L.append("")
     L.append("Summary (count of findings)")
     modes = [m["name"] for m in summary["modes"]] + (["*"] if any(f.mode == "*" for f in findings) else [])
     L.append("  %-10s" % "severity" + "".join("%12s" % m[:12] for m in modes))
@@ -3861,7 +3890,8 @@ def write_reports(out_dir, findings, summary):
         for f in findings:
             if f.mode != m:
                 continue
-            where = ("%s:%d" % (f.file, f.line) if f.line else f.file) if f.file else ""
+            fshort = short_name.get(f.file, f.file)
+            where = ("%s:%d" % (fshort, f.line) if f.line else fshort) if f.file else ""
             L.append("%-7s %-9s %s %s" % (f.sev, f.rule, where, f.msg))
             if f.cmd:
                 L.append("        cmd: %s" % f.cmd)
