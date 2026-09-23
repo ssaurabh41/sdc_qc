@@ -54,11 +54,12 @@ def _log(msg):
 
 
 class Finding(object):
-    __slots__ = ("rule", "sev", "mode", "file", "line", "cmd", "obj", "msg")
+    __slots__ = ("rule", "sev", "mode", "file", "line", "cmd", "obj", "msg", "waiver")
 
-    def __init__(self, rule, sev, mode, file, line, cmd, obj, msg):
+    def __init__(self, rule, sev, mode, file, line, cmd, obj, msg, waiver=None):
         self.rule, self.sev, self.mode = rule, sev, mode
         self.file, self.line, self.cmd, self.obj, self.msg = file, line, cmd, obj, msg
+        self.waiver = waiver
 
     def as_dict(self):
         return dict((k, getattr(self, k)) for k in self.__slots__)
@@ -3828,7 +3829,1027 @@ def cross_mode_checks(modes, d, mx):
 # 8. Reporting
 # =============================================================================
 
-def write_reports(out_dir, findings, summary):
+# =============================================================================
+# 8a. Waivers (schema sdc_qc.waivers/1). The same matching runs in the HTML report JS.
+# =============================================================================
+
+WAIVER_SCHEMA = "sdc_qc.waivers/1"
+_WAIVER_FIELDS = ("id", "rule", "scope", "file", "obj", "msg", "modes", "reason", "author",
+                  "created", "batch", "expires")
+_WAIVER_BREADTH = {"rule": 0, "file": 1, "finding": 2}
+
+
+def _base(p):
+    return re.split(r"[\\/]", p)[-1] if p else ""
+
+
+def _glob_rx(pat):
+    # anchored glob: * -> .*, ? -> . (mirrors the JS rx() in the HTML report)
+    return re.compile(re.escape(pat).replace("\\*", ".*").replace("\\?", "."))
+
+
+def _waiver_num(wid):
+    digits = re.sub(r"\D", "", str(wid or ""))
+    return int(digits) if digits else 0
+
+
+def load_waivers(paths):
+    """Loads and merges -waivers files. Bad JSON / schema / fields -> tool error (exit 2)."""
+    out = []
+    for p in paths:
+        try:
+            with open(p) as fh:
+                doc = json.load(fh)
+        except (IOError, OSError) as e:
+            _fatal("ERROR: cannot read -waivers file %s: %s" % (p, e))
+        except ValueError as e:
+            _fatal("ERROR: -waivers file %s is not valid JSON: %s" % (p, e))
+        if not isinstance(doc, dict) or doc.get("schema") != WAIVER_SCHEMA:
+            _fatal("ERROR: -waivers file %s: unknown schema %r (expected %r)"
+                   % (p, doc.get("schema") if isinstance(doc, dict) else None, WAIVER_SCHEMA))
+        ws = doc.get("waivers")
+        if not isinstance(ws, list):
+            _fatal("ERROR: -waivers file %s: 'waivers' must be a list" % p)
+        for i, w in enumerate(ws):
+            where = "%s: waiver #%d" % (p, i + 1)
+            if not isinstance(w, dict) or not isinstance(w.get("rule"), str) or not w["rule"]:
+                _fatal("ERROR: %s has no 'rule'" % where)
+            for k in ("id", "scope", "file", "obj", "msg", "reason", "author", "created", "batch",
+                      "expires"):
+                if w.get(k) is not None and not isinstance(w[k], str):
+                    _fatal("ERROR: %s: '%s' must be a string or null" % (where, k))
+            m = w.get("modes")
+            if m is not None and (not isinstance(m, list) or not all(isinstance(x, str) for x in m)):
+                _fatal("ERROR: %s: 'modes' must be a list of strings or null" % where)
+            rec = collections.OrderedDict((k, w.get(k)) for k in _WAIVER_FIELDS)
+            for k, v in w.items():
+                if k not in rec:
+                    rec[k] = v
+            out.append(rec)
+    n = max([_waiver_num(w["id"]) for w in out] + [0])
+    for w in out:
+        if not w["id"]:
+            n += 1
+            w["id"] = "W-%04d" % n
+    return out
+
+
+def _utc_today():
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def _compile_waiver(w, today):
+    return (w,
+            None if w.get("file") in (None, "*") else _glob_rx(w["file"]),
+            None if w.get("obj") is None else _glob_rx(w["obj"]),
+            not (w.get("expires") and w["expires"] < today))
+
+
+def _waiver_hit(cw, f):
+    w, frx, orx, live = cw
+    if not live or w["rule"] != f.rule:
+        return False
+    if frx is not None and not frx.fullmatch(_base(f.file)):
+        return False
+    if orx is not None and not orx.fullmatch(f.obj or ""):
+        return False
+    if w.get("msg") is not None and w["msg"] != f.msg:
+        return False
+    if w.get("modes"):
+        return ("cross-mode" if f.mode == "*" else f.mode) in w["modes"]
+    return True
+
+
+def apply_waivers(findings, waivers):
+    """Sets f.waiver to the first matching waiver id. Returns [(status, n_matches)] per
+    waiver: expired / unused / redundant / active (walked broadest first)."""
+    today = _utc_today()
+    cws = [_compile_waiver(w, today) for w in waivers]
+    matches = [[] for _ in waivers]
+    for fi, f in enumerate(findings):
+        f.waiver = None
+        for wi, cw in enumerate(cws):
+            if _waiver_hit(cw, f):
+                matches[wi].append(fi)
+                if f.waiver is None:
+                    f.waiver = cw[0]["id"]
+    order = sorted(range(len(waivers)),
+                   key=lambda i: (_WAIVER_BREADTH.get(waivers[i].get("scope"), 1), i))
+    covered, status = set(), [None] * len(waivers)
+    for i in order:
+        if not cws[i][3]:
+            status[i] = "expired"
+        elif not matches[i]:
+            status[i] = "unused"
+        elif all(fi in covered for fi in matches[i]):
+            status[i] = "redundant"
+        else:
+            status[i] = "active"
+            covered.update(matches[i])
+    return [(status[i], len(matches[i])) for i in range(len(waivers))]
+
+
+def collect_sources(findings, summary, max_kb):
+    """SDC text for the HTML source view: path -> text. Files over max_kb keep only
+    +-20 lines around each finding (other lines blanked, so line numbers stay valid)."""
+    want = collections.OrderedDict()
+    for m in summary["modes"]:
+        for p in m["files"]:
+            want.setdefault(p, set())
+    for f in findings:
+        if f.file and f.line:
+            want.setdefault(f.file, set()).add(f.line)
+    out = collections.OrderedDict()
+    for p, lines in want.items():
+        try:
+            opener = gzip.open if p.endswith(".gz") else open
+            with opener(p, "rt", encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except (IOError, OSError):
+            continue
+        if max_kb > 0 and len(text.encode("utf-8")) > max_kb * 1024:
+            keep = set()
+            for ln in lines:
+                keep.update(range(ln - 20, ln + 21))
+            text = "\n".join(t if i + 1 in keep else "" for i, t in enumerate(text.split("\n")))
+        out[p] = text
+    return out
+
+
+# =============================================================================
+# 8b. HTML report (sdc_qc.html): one self-contained file, no network, no build step.
+#     The template is filled with str.replace only; the data block holds sdc_qc.json.
+# =============================================================================
+
+_HTML_FONTS = "<!--SDC_QC_FONTS-->"
+_HTML_DATA = "/*SDC_QC_DATA*/"
+
+
+def write_html(path, doc, fonts_url=None):
+    data = json.dumps(doc, separators=(",", ":")).replace("<", "\\u003c")
+    head, tail = HTML_TEMPLATE.split(_HTML_DATA, 1)
+    fonts = ""
+    if fonts_url:
+        fonts = '<link rel="stylesheet" href="%s">' % (
+            fonts_url.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;"))
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(head.replace(_HTML_FONTS, fonts, 1) + data + tail)
+
+
+HTML_TEMPLATE = r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sdc_qc</title>
+<!--SDC_QC_FONTS-->
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{background:var(--bg,#f5f8fc)}
+#app{height:100vh;min-height:560px;min-width:1100px;display:flex;flex-direction:column;background:var(--bg);color:var(--text);font-family:var(--fb);font-size:13px;line-height:1.4}
+#app.t-router{--bg:#f5f8fc;--surface:#fff;--card:#fff;--panel:#fbfcfe;--text:#0f1b3d;--muted:#4a5878;--faint:#6c7894;--line:color-mix(in srgb,#0f1b3d 13%,transparent);--soft:color-mix(in srgb,#0f1b3d 6%,transparent);--accent:#1f6bff;--accent-t:#1552cc;--on-accent:#fff;--err:#e5484d;--err-t:#c3353a;--warn:#f0a020;--warn-t:#8a5a00;--info:#7fb0ff;--info-t:#1552cc;--pass:#1f6bff;
+ --fh:"Plus Jakarta Sans","Segoe UI",system-ui,-apple-system,sans-serif;--fb:"Plus Jakarta Sans","Segoe UI",system-ui,-apple-system,sans-serif;--fm:"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace}
+#app.t-industry{--bg:#f2f2f3;--surface:#e9e9ea;--card:#f2f2f3;--panel:#ebebec;--text:#1d1f20;--muted:#5d5d60;--faint:#7a7a7d;--line:color-mix(in srgb,#1d1f20 15%,transparent);--soft:color-mix(in srgb,#1d1f20 7%,transparent);--accent:#5980a6;--accent-t:#416180;--on-accent:#fff;--err:oklch(.56 .15 28);--err-t:oklch(.47 .14 28);--warn:oklch(.76 .12 78);--warn-t:oklch(.49 .09 70);--info:#94bce3;--info-t:#416180;--pass:#597ea3;
+ --fh:"Barlow Condensed","Segoe UI",system-ui,-apple-system,sans-serif;--fb:"Barlow","Segoe UI",system-ui,-apple-system,sans-serif;--fm:ui-monospace,Menlo,Consolas,monospace}
+#app{--t-err:color-mix(in oklch,var(--err) 18%,var(--card));--t-warn:color-mix(in oklch,var(--warn) 18%,var(--card));--t-info:color-mix(in oklch,var(--info) 18%,var(--card))}
+a{color:var(--accent-t)}
+button,input,select{font:inherit;color:inherit}
+button{cursor:pointer}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.mono{font-family:var(--fm)}
+.hov:hover{background:color-mix(in srgb,var(--accent) 10%,transparent)}
+.btn{flex:none;display:flex;align-items:center;gap:6px;height:30px;padding:0 10px;border-radius:8px;border:1px solid var(--line);background:transparent;font-size:12px;white-space:nowrap}
+.btn:hover{background:color-mix(in srgb,var(--accent) 10%,transparent)}
+.btn.on{background:color-mix(in srgb,var(--accent) 13%,transparent)}
+.btn .n{font-family:var(--fm);font-size:11px;color:var(--muted)}
+.btn.dim{opacity:.45}
+.sq{width:10px;height:10px;border-radius:3px;border:1px solid var(--accent);background:transparent;flex:none}
+.sq.on{background:var(--accent)}
+.lnk{border:0;background:none;padding:0;color:var(--accent-t)}
+.lnk:hover{text-decoration:underline}
+/* header */
+header{flex:none;position:relative;display:flex;flex-direction:column;background:var(--card);border-bottom:1px solid var(--line)}
+.h1{display:flex;align-items:center;gap:14px;padding:8px 12px 6px}
+.brand{display:flex;align-items:baseline;gap:8px;white-space:nowrap}
+.brand b{font-family:var(--fh);font-weight:700;font-size:18px;letter-spacing:-.01em}
+.brand span{color:var(--muted)}
+.verdict{padding:3px 11px;border-radius:999px;font-size:12px;font-weight:700;letter-spacing:.06em;white-space:nowrap;color:#fff}
+#strip{flex:1;display:flex;flex-wrap:wrap;gap:3px;min-width:0}
+.mc{display:flex;flex-direction:column;gap:4px;min-width:84px;padding:5px 10px;border-radius:8px;border:1px solid var(--line);background:transparent;text-align:left}
+.mc:hover{background:color-mix(in srgb,var(--accent) 8%,transparent)}
+.mc.on{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 13%,transparent)}
+.mc .l1{display:flex;justify-content:space-between;gap:8px;font-size:11.5px}
+.mc .l1 b{font-weight:500;white-space:nowrap}
+.mc .l1 span{font-family:var(--fm);font-size:10.5px}
+.mc .bar{display:flex;height:4px;border-radius:2px;overflow:hidden;background:var(--soft)}
+.h2{display:flex;align-items:center;gap:6px;padding:0 12px 8px}
+#q{flex:1;max-width:440px;min-width:200px;height:30px;padding:4px 10px;font-size:12.5px;color:var(--text);background:var(--surface);border:1px solid var(--line);border-radius:8px}
+#q:focus{border-color:var(--accent);outline:none}
+.wdot{width:6px;height:6px;border-radius:50%;background:var(--warn)}
+.ib{width:30px;justify-content:center;padding:0}
+/* settings */
+.bd{position:fixed;inset:0;z-index:40}
+#menu{position:absolute;top:calc(100% + 4px);right:12px;z-index:50;width:300px;max-height:calc(100vh - 90px);overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding:10px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:0 16px 48px rgba(15,27,61,.16);font-size:12.5px}
+.tg{display:grid;grid-template-columns:12px minmax(0,1fr) auto;align-items:center;gap:8px;padding:4px 6px;border:0;border-radius:6px;background:transparent;text-align:left;width:100%}
+.tg:hover{background:color-mix(in srgb,var(--accent) 8%,transparent)}
+.kbd{font-family:var(--fm);font-size:10.5px;color:var(--faint)}
+.sgrid{display:grid;grid-template-columns:72px minmax(0,1fr);align-items:center;gap:6px 8px;padding:8px 6px 0;border-top:1px solid var(--soft)}
+.sgrid>span{color:var(--muted)}
+.seg{display:flex;gap:2px;padding:2px;border:1px solid var(--line);border-radius:8px}
+.seg button{flex:1;height:22px;border:0;border-radius:6px;background:transparent;color:var(--text);font-size:12px;white-space:nowrap;padding:0 8px}
+.seg button.on{background:var(--accent);color:var(--on-accent)}
+.sel,.inp{height:28px;padding:0 6px;font-size:12px;color:var(--text);background:var(--surface);border:1px solid var(--line);border-radius:8px}
+.inp{padding:3px 8px}
+.inp:focus{border-color:var(--accent);outline:none}
+.lims{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:4px}
+.lims label{display:flex;align-items:center;gap:5px;height:28px;padding:0 6px;border:1px solid var(--line);border-radius:8px;background:var(--surface)}
+.lims i{flex:none;width:7px;height:7px;border-radius:50%}
+.lims input{width:100%;min-width:0;border:0;padding:0;background:transparent;font-family:var(--fm);font-size:11.5px;color:var(--text);outline:none}
+.mfoot{display:flex;align-items:center;gap:10px;padding:8px 6px 2px;border-top:1px solid var(--soft);font-size:11.5px}
+/* body */
+#main{flex:1;min-height:0;position:relative;display:grid}
+.rh{position:absolute;top:0;bottom:0;width:6px;cursor:col-resize;z-index:5}
+.rh:hover{background:color-mix(in srgb,var(--accent) 35%,transparent)}
+#facets{overflow-y:auto;border-right:1px solid var(--line);background:var(--bg);padding:10px 0 20px;display:flex;flex-direction:column;gap:14px}
+.fg{display:flex;flex-direction:column}
+.fgt{display:flex;justify-content:space-between;padding:0 12px 4px;font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint)}
+.fgt button{font-size:10.5px;letter-spacing:.06em}
+.fi{display:grid;grid-template-columns:10px minmax(0,1fr) auto;align-items:center;gap:7px;margin:0 4px;padding:3px 8px;border:0;border-radius:6px;background:transparent;text-align:left}
+.fi:hover{background:color-mix(in srgb,var(--text) 6%,transparent)}
+.fi.on{background:color-mix(in srgb,var(--accent) 13%,transparent)}
+.fi .cb{width:9px;height:9px;border-radius:3px;border:1px solid var(--faint)}
+.fi.on .cb{border-color:var(--accent)}
+.fi .fl{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px}
+.fi .fl.mono{font-size:11px}
+.fi .fn{font-size:11px;font-variant-numeric:tabular-nums;color:var(--muted)}
+#tsec{min-width:0;display:flex;flex-direction:column;background:var(--card)}
+#thead{flex:none;display:grid;gap:10px;padding:6px 12px;border-bottom:1px solid var(--line);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase}
+#thead button{padding:0;border:0;background:none;letter-spacing:inherit;text-transform:inherit;text-align:left;white-space:nowrap;color:var(--muted)}
+#thead button.on{color:var(--text)}
+#list{flex:1;overflow-y:auto;position:relative}
+.row{display:grid;gap:10px;align-items:center;padding:4px 12px;border-bottom:1px solid var(--soft);cursor:pointer}
+#app.comfy .row{padding:8px 12px}
+#app.wrap .row{align-items:baseline}
+.row:hover{background:color-mix(in srgb,var(--accent) 8%,transparent)}
+.row.sel{background:color-mix(in srgb,var(--accent) 14%,transparent);box-shadow:inset 2px 0 0 var(--accent)}
+.row>*{min-width:0}
+.row.wv .c{opacity:.5}
+.c-sev{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:600;letter-spacing:.03em}
+.dot{flex:none;width:8px;height:8px;border-radius:50%}
+.c-rule{font-family:var(--fm);font-size:11.5px;white-space:nowrap}
+.c-mode{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--muted)}
+.c-loc{font-family:var(--fm);font-size:11.5px;color:var(--accent-t);text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.c-loc:hover{text-decoration:underline}
+.c-msgw{display:flex;align-items:baseline;gap:7px;min-width:0}
+.c-msg{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#app.wrap .c-msg{white-space:normal;overflow-wrap:anywhere}
+.wtag{flex:none;padding:0 5px;border-radius:4px;font-size:10px;font-weight:600;letter-spacing:.06em;border:1px solid var(--line);color:var(--muted)}
+.empty{padding:24px 12px;color:var(--muted)}
+.over{display:flex;align-items:center;gap:12px;padding:10px 12px;font-size:12px;color:var(--muted)}
+/* detail */
+#pane{min-width:0;overflow-y:auto;border-left:1px solid var(--line);background:var(--panel)}
+.dp{display:flex;flex-direction:column;gap:10px;padding:12px 12px 20px}
+.dh{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.stag{padding:1px 7px;border-radius:6px;font-size:10.5px;font-weight:700;letter-spacing:.03em}
+.dtitle{font-family:var(--fh);font-weight:600;font-size:15.5px;line-height:1.2}
+.dmsg{font-size:12.5px;line-height:1.45;overflow-wrap:anywhere}
+.kv{display:grid;grid-template-columns:58px minmax(0,1fr);gap:6px 8px;align-items:baseline;font-size:12px}
+.k{font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint)}
+.pills{display:flex;gap:3px;flex-wrap:wrap}
+.mp{padding:0 7px;border-radius:999px;font-size:11px;line-height:18px;border:1px solid var(--line);color:var(--faint)}
+.oc{font-family:var(--fm);font-size:11px;padding:0 6px;line-height:18px;border-radius:6px;border:1px solid var(--line);background:var(--bg);overflow-wrap:anywhere}
+.src{overflow-x:auto;padding:4px 0;border-radius:8px;border:1px solid var(--line);background:var(--bg);font-family:var(--fm);font-size:11px;line-height:1.65}
+.src>div{display:grid;grid-template-columns:32px 6px max-content;gap:6px;align-items:center;padding:0 8px 0 0;min-width:100%}
+.src .ln{text-align:right;color:var(--faint)}
+.src .sd{width:6px;height:6px;border-radius:50%}
+.src .tx{white-space:pre}
+.cmd{font-family:var(--fm);font-size:11.5px;line-height:1.5;padding:6px 8px;border-radius:8px;background:var(--bg);border:1px solid var(--line);white-space:pre-wrap;word-break:break-word;margin:0}
+.acts{display:flex;gap:6px;flex-wrap:wrap}
+.acts button{height:26px;padding:0 10px;border-radius:8px;border:1px solid var(--line);background:transparent;font-size:12px;color:var(--text)}
+.wsec{display:flex;flex-direction:column;gap:6px;padding-top:10px;border-top:1px solid var(--line)}
+.radio{display:grid;grid-template-columns:12px minmax(0,1fr) auto;align-items:center;gap:8px;padding:4px 8px;border-radius:8px;border:1px solid var(--line);background:transparent;font-size:12px;color:var(--text);text-align:left;width:100%}
+.radio:hover{border-color:var(--accent)}
+.radio.on{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent)}
+.radio .rd{width:10px;height:10px;border-radius:50%;border:1px solid var(--accent);box-shadow:inset 0 0 0 2px var(--panel)}
+.radio.on .rd{background:var(--accent)}
+.radio .rl{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.radio .rn{font-family:var(--fm);font-size:10.5px;color:var(--faint)}
+.wrow{display:flex;gap:6px}
+.wrow input{flex:1;min-width:0;height:28px;padding:3px 8px;font-size:12px;color:var(--text);background:var(--bg);border:1px solid var(--line);border-radius:8px}
+.wrow input:focus{border-color:var(--accent);outline:none}
+.pri{flex:none;height:28px;padding:0 14px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);font-size:12px;font-weight:600;color:var(--on-accent)}
+.pri:active{filter:brightness(.9)}
+.wcard{display:flex;flex-direction:column;gap:3px;padding:7px 9px;border-radius:8px;border:1px solid var(--line);background:color-mix(in srgb,var(--accent) 6%,transparent)}
+.wcard .a{display:flex;justify-content:space-between;gap:8px;font-size:12px}
+.wcard .m{display:flex;justify-content:space-between;gap:8px;font-size:11px;color:var(--faint)}
+.nosel{padding:20px 12px;color:var(--muted)}
+/* dialogs */
+.dbd{position:fixed;inset:0;z-index:60;background:rgba(15,27,61,.28)}
+.dlg{position:fixed;z-index:61;left:50%;transform:translateX(-50%);background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:0 20px 60px rgba(15,27,61,.22)}
+.dlg-b{top:14vh;width:440px;display:flex;flex-direction:column;gap:10px;padding:16px}
+.dlg-b .radio{padding:6px 9px;font-size:12.5px}
+.dlg-b .radio .rd{box-shadow:inset 0 0 0 2px var(--card)}
+.dlg-b .radio .rn{font-size:11px}
+.dt{font-family:var(--fh);font-weight:600;font-size:17px}
+.dlg-w{top:8vh;width:min(820px,94vw);max-height:84vh;display:flex;flex-direction:column}
+.dwh{flex:none;display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line)}
+.dwh .seg button{height:24px;padding:0 10px}
+.b28{height:28px;padding:0 10px;border-radius:8px;border:1px solid var(--line);background:transparent;font-size:12px;color:var(--text);display:flex;align-items:center;cursor:pointer}
+.wg{display:grid;grid-template-columns:64px 72px minmax(0,1fr) 56px 76px 22px;gap:10px;align-items:center;padding:6px 14px;border-bottom:1px solid var(--soft);font-size:12px}
+.wg.hd{flex:none;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint)}
+.wg .tt{display:flex;flex-direction:column;min-width:0}
+.wg .tt span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wg .tt span+span{font-size:11.5px;color:var(--muted)}
+.st{padding:1px 7px;border-radius:999px;font-size:10.5px;font-weight:600;white-space:nowrap}
+.st-active{background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--accent-t)}
+.st-unused,.st-redundant{background:color-mix(in srgb,var(--warn) 22%,transparent);color:var(--warn-t)}
+.st-expired{background:var(--soft);color:var(--muted)}
+.xb{width:22px;height:22px;padding:0;border:0;border-radius:6px;background:transparent;font-size:14px;line-height:1;color:var(--muted)}
+.xb:hover{background:color-mix(in srgb,var(--err) 14%,transparent)}
+.dwf{flex:none;display:flex;align-items:center;gap:8px;padding:10px 14px;border-top:1px solid var(--line);font-size:11.5px;color:var(--faint)}
+</style>
+</head>
+<body>
+<div id="app" class="t-router">
+  <header>
+    <div class="h1">
+      <div class="brand"><b>sdc_qc</b><span id="top"></span></div>
+      <span id="verdict" class="verdict"></span>
+      <div id="strip"></div>
+    </div>
+    <div class="h2">
+      <input id="q" placeholder="Search rule, message, object, file:line     /" autocomplete="off" spellcheck="false">
+      <button id="b-clear" class="btn" data-act="clearAll" title="Clear search and all filters (Esc)">Clear all</button>
+      <button id="b-hw" class="btn" data-act="hideWaived" title="Hide or show waived findings"></button>
+      <button id="b-bulk" class="btn" data-act="openBulk" title="Waive every unwaived finding in the current view">Waive view…</button>
+      <button id="b-w" class="btn" data-act="openWaivers" title="Manage waivers, unused and redundant report"></button>
+      <button id="b-link" class="btn" data-act="copyLink" title="Copy a link to this exact view" style="margin-left:auto"></button>
+      <button id="b-pane" class="btn ib" data-act="pane" title="Detail pane  ]"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"></rect><path d="M15 3v18"></path></svg></button>
+      <button id="b-menu" class="btn" data-act="menu" title="Settings"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="21" x2="14" y1="4" y2="4"></line><line x1="10" x2="3" y1="4" y2="4"></line><line x1="21" x2="12" y1="12" y2="12"></line><line x1="8" x2="3" y1="12" y2="12"></line><line x1="21" x2="16" y1="20" y2="20"></line><line x1="12" x2="3" y1="20" y2="20"></line><line x1="14" x2="14" y1="2" y2="6"></line><line x1="8" x2="8" y1="10" y2="14"></line><line x1="16" x2="16" y1="18" y2="22"></line></svg>Settings</button>
+    </div>
+    <div id="menuwrap"></div>
+  </header>
+  <div id="main">
+    <div class="rh" id="rh-l" data-drag="leftW" title="Drag to resize"></div>
+    <div class="rh" id="rh-r" data-drag="paneW" title="Drag to resize"></div>
+    <aside id="facets"></aside>
+    <section id="tsec"><div id="thead"></div><div id="list"></div></section>
+    <aside id="pane"></aside>
+  </div>
+  <div id="dlg"></div>
+</div>
+<script id="sdc-data" type="application/json">/*SDC_QC_DATA*/</script>
+<script>
+(function () {
+'use strict';
+var D = JSON.parse(document.getElementById('sdc-data').textContent);
+var SM = D.summary || {}, TOP = SM.top || 'design', RULES = D.rules || {}, SRC = D.sources || {};
+var CATS = { PARSE: 'Parse', DES: 'Design', LIB: 'Liberty', UNIT: 'Units', OBJ: 'Objects', CLK: 'Clocks', COV: 'Clock coverage', IO: 'I/O', EXC: 'Exceptions', CG: 'Clock groups', CASE: 'Case analysis', MISC: 'Misc', MODE: 'Cross-mode' };
+var SEVS = ['ERROR', 'WARNING', 'INFO'], RANK = { ERROR: 0, WARNING: 1, INFO: 2 };
+var SV = { ERROR: 'err', WARNING: 'warn', INFO: 'info' }, SL = { ERROR: 'ERROR', WARNING: 'WARN', INFO: 'INFO' };
+var FONTS = ['theme', 'Plus Jakarta Sans', 'Barlow', 'IBM Plex Sans', 'Source Sans 3', 'Manrope', 'Work Sans', 'Space Grotesk', 'JetBrains Mono'];
+var SCOPES = { finding: 'Only this finding', file: 'Rule in file', rule: 'Rule everywhere' };
+var BREADTH = { rule: 0, file: 1, finding: 2 };
+var DEF = { loc: false, wrap: false, group: true, pane: true, paneW: 340, leftW: 160, hideWaived: false, density: 'compact', size: 'M',
+  limits: { ERROR: 200, WARNING: 200, INFO: 200 }, theme: 'router', font: 'theme', author: '', open: 'file' };
+var CFG_KEY = 'sdcqc.cfg', W_KEY = 'sdcqc.waivers.' + TOP;
+var today = new Date().toISOString().slice(0, 10);
+
+function $(id) { return document.getElementById(id); }
+function base(p) { return p ? String(p).split(/[\\/]/).pop() : ''; }
+function fmt(n) { return Number(n).toLocaleString('en-US'); }
+function h(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+function has(o) { for (var k in o) if (o[k]) return true; return false; }
+function load(k, d) { try { var v = JSON.parse(localStorage.getItem(k)); return v == null ? d : v; } catch (e) { return d; } }
+function save(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+function tint(s) { return 'var(--t-' + SV[s] + ')'; }
+function col(s) { return 'var(--' + SV[s] + ')'; }
+function colT(s) { return 'var(--' + SV[s] + '-t)'; }
+function copyText(t) {
+  try { if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(t); return; } } catch (e) {}
+  var ta = document.createElement('textarea'); ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select(); try { document.execCommand('copy'); } catch (e) {} ta.remove();
+}
+function dl(name, text, type) {
+  var a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type: type })); a.download = name;
+  document.body.appendChild(a); a.click(); setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+}
+
+// ---------------------------------------------------------------- data
+var F = (D.findings || []).map(function (f, i) {
+  var cat = f.rule.split('-')[0], meta = RULES[f.rule] || [f.sev, f.rule], cross = f.mode === '*', fb = base(f.file);
+  var mode = cross ? 'cross-mode' : f.mode;
+  return { id: i, rule: f.rule, cat: cat, sev: f.sev, mode: mode, modeList: [mode], file: f.file || '', fileBase: fb, line: f.line || 0,
+    loc: f.file ? fb + (f.line ? ':' + f.line : '') : '—', cmd: f.cmd || '', obj: f.obj || '', objs: f.obj ? String(f.obj).split(/\s+/).filter(Boolean) : [],
+    msg: f.msg || '', title: meta[1], defSev: meta[0], ids: [i], key: 'f' + i,
+    hay: (f.rule + ' ' + (f.msg || '') + ' ' + (f.cmd || '') + ' ' + (f.obj || '') + ' ' + fb + ':' + (f.line || '') + ' ' + mode).toLowerCase() };
+});
+var modeNames = (SM.modes || []).map(function (m) { return m.name; });
+var modeKeys = modeNames.concat(F.some(function (x) { return x.mode === 'cross-mode'; }) ? ['cross-mode'] : []);
+var G = [], gmap = {}, groupOf = [];
+F.forEach(function (f) {
+  var k = [f.rule, f.fileBase, f.line, f.cmd, f.obj, f.msg].join('|'), x = gmap[k];
+  if (!x) { x = gmap[k] = Object.assign({}, f, { key: 'i' + f.id, modeList: [], ids: [] }); G.push(x); }
+  if (x.modeList.indexOf(f.mode) < 0) x.modeList.push(f.mode);
+  x.ids.push(f.id); groupOf[f.id] = x;
+});
+var catKeys = Object.keys(CATS).filter(function (c) { return F.some(function (f) { return f.cat === c; }); })
+  .concat(F.map(function (f) { return f.cat; }).filter(function (c, i, a) { return !CATS[c] && a.indexOf(c) === i; }));
+var rmap = {};
+F.forEach(function (f) {
+  var x = rmap[f.rule] || (rmap[f.rule] = { rule: f.rule, title: f.title, sev: f.sev, count: 0 });
+  x.count++; if (RANK[f.sev] < RANK[x.sev]) x.sev = f.sev;
+});
+var ruleList = Object.keys(rmap).map(function (k) { return rmap[k]; })
+  .sort(function (a, b) { return RANK[a.sev] - RANK[b.sev] || b.count - a.count || (a.rule < b.rule ? -1 : 1); });
+// file -> line -> worst severity, for the dots in the source view
+var lineSev = {};
+F.forEach(function (f) {
+  if (!f.file || !f.line) return;
+  var m = lineSev[f.file] || (lineSev[f.file] = {}), c = m[f.line];
+  if (!c || RANK[f.sev] < RANK[c]) m[f.line] = f.sev;
+});
+
+// ---------------------------------------------------------------- config
+function initCfg() {
+  var c = load(CFG_KEY, {}) || {}, r = Object.assign({}, DEF, c);
+  r.limits = Object.assign({}, DEF.limits, c.limits || {});
+  if (r.theme !== 'router' && r.theme !== 'industry') r.theme = 'router';
+  return r;
+}
+var cfg = initCfg();
+function setCfg(p) { Object.assign(cfg, p); save(CFG_KEY, cfg); render(); }
+
+// ---------------------------------------------------------------- waivers
+// Embedded waivers come from -waivers; the browser keeps its own additions and deletions per top.
+var EMB = D.waivers || [], EMB_ID = {};
+EMB.forEach(function (w) { EMB_ID[w.id] = JSON.stringify(w); });
+function loadW() {
+  var loc = load(W_KEY, null) || {}, del = loc.deleted || [], byId = {}, order = [];
+  EMB.forEach(function (w) { if (del.indexOf(w.id) < 0 && !byId[w.id]) { byId[w.id] = w; order.push(w.id); } });
+  (loc.added || []).forEach(function (w) { if (!w || !w.rule || !w.id) return; if (!byId[w.id]) order.push(w.id); byId[w.id] = w; });
+  return order.map(function (id) { return byId[id]; });
+}
+var WL = loadW(), WV = null;
+function setW(list) {
+  WL = list;
+  var ids = {}; list.forEach(function (w) { ids[w.id] = 1; });
+  save(W_KEY, { added: list.filter(function (w) { return EMB_ID[w.id] !== JSON.stringify(w); }),
+    deleted: Object.keys(EMB_ID).filter(function (id) { return !ids[id]; }) });
+  WV = null; render();
+}
+function rx(p) { return new RegExp('^' + String(p).replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$'); }
+function compile(w) { return { w: w, o: w.obj != null ? rx(w.obj) : null, f: w.file != null && w.file !== '*' ? rx(w.file) : null, live: !(w.expires && w.expires < today) }; }
+function hit(cw, x) {
+  return cw.live && cw.w.rule === x.rule && !(cw.f && !cw.f.test(x.fileBase)) && !(cw.o && !cw.o.test(x.obj)) &&
+    !(cw.w.msg != null && cw.w.msg !== x.msg) && !(cw.w.modes && cw.w.modes.length && cw.w.modes.indexOf(x.mode) < 0);
+}
+function nextN(list) { return 1 + Math.max.apply(null, [0].concat(list.map(function (w) { return parseInt(String(w.id).replace(/\D/g, ''), 10) || 0; }))); }
+function wid(n) { return 'W-' + String(n).padStart(4, '0'); }
+function mk(x, sc, reason, n, batch) {
+  return { id: wid(n), rule: x.rule, scope: sc, file: sc === 'rule' ? null : (x.fileBase || ''), obj: sc === 'finding' ? (x.obj || null) : null,
+    msg: sc === 'finding' ? x.msg : null, modes: null, reason: reason || null, author: cfg.author || null, created: today, batch: batch || null, expires: null };
+}
+// Per-finding first matching waiver, per-waiver matches and status (same walk as sdc_qc.py).
+function waivers() {
+  if (WV) return WV;
+  var cws = WL.map(compile), byRule = {}, fw = new Array(F.length), m = cws.map(function () { return []; });
+  cws.forEach(function (c, j) { (byRule[c.w.rule] || (byRule[c.w.rule] = [])).push(j); });
+  F.forEach(function (x) {
+    fw[x.id] = null;
+    (byRule[x.rule] || []).forEach(function (j) { if (hit(cws[j], x)) { m[j].push(x.id); if (!fw[x.id]) fw[x.id] = cws[j].w; } });
+  });
+  var br = function (i) { var b = BREADTH[WL[i].scope]; return b == null ? 1 : b; };
+  var order = cws.map(function (c, i) { return i; }).sort(function (a, b) { return br(a) - br(b) || a - b; });
+  var covered = {}, status = [];
+  order.forEach(function (i) {
+    if (!cws[i].live) status[i] = 'expired';
+    else if (!m[i].length) status[i] = 'unused';
+    else if (m[i].every(function (id) { return covered[id]; })) status[i] = 'redundant';
+    else { status[i] = 'active'; m[i].forEach(function (id) { covered[id] = 1; }); }
+  });
+  var nU = status.filter(function (s) { return s === 'unused' || s === 'expired'; }).length;
+  var nR = status.filter(function (s) { return s === 'redundant'; }).length;
+  WV = { fw: fw, m: m, status: status, nUnused: nU, nRedundant: nR,
+    errLeft: F.filter(function (x) { return x.sev === 'ERROR' && !fw[x.id]; }).length };
+  return WV;
+}
+function rowWaiver(x) { var fw = waivers().fw; for (var i = 0; i < x.ids.length; i++) if (fw[x.ids[i]]) return fw[x.ids[i]]; return null; }
+
+// ---------------------------------------------------------------- view state
+function emptyF() { return { sev: {}, mode: {}, cat: {}, rule: {} }; }
+var st = { q: '', f: emptyF(), sel: null, sort: 'sev', dir: 1, menu: false, dlg: null, wTab: 'all', wScope: 'finding', wReason: '',
+  bScope: 'finding', bReason: '', showAll: false, note: '', copied: false, linkCopied: false };
+var V = null; // last computed view
+
+var CMP = {
+  sev: function (a, b) { return RANK[a.sev] - RANK[b.sev] || (a.rule < b.rule ? -1 : a.rule > b.rule ? 1 : 0); },
+  rule: function (a, b) { return a.rule < b.rule ? -1 : a.rule > b.rule ? 1 : 0; },
+  mode: function (a, b) { var x = a.modeList.join(), y = b.modeList.join(); return x < y ? -1 : x > y ? 1 : 0; },
+  loc: function (a, b) { return a.fileBase < b.fileBase ? -1 : a.fileBase > b.fileBase ? 1 : a.line - b.line; },
+  msg: function (a, b) { return a.msg < b.msg ? -1 : a.msg > b.msg ? 1 : 0; }
+};
+function computeView() {
+  var all = cfg.group ? G : F, q = st.q.toLowerCase(), f = st.f;
+  all.forEach(function (x) { x.wv = rowWaiver(x); });
+  var vis = cfg.hideWaived ? all.filter(function (x) { return !x.wv; }) : all;
+  var hs = has(f.sev), hm = has(f.mode), hc = has(f.cat), hr = has(f.rule);
+  var ok = function (x) {
+    return (!hs || f.sev[x.sev]) && (!hc || f.cat[x.cat]) && (!hr || f.rule[x.rule]) &&
+      (!hm || x.modeList.some(function (m) { return f.mode[m]; })) && (!q || x.hay.indexOf(q) >= 0);
+  };
+  var cmp = CMP[st.sort] || CMP.sev, dir = st.dir;
+  var sorted = vis.filter(ok).sort(function (a, b) { return cmp(a, b) * dir || a.id - b.id; });
+  var used = { ERROR: 0, WARNING: 0, INFO: 0 }, over = { ERROR: 0, WARNING: 0, INFO: 0 };
+  var list = st.showAll ? sorted : sorted.filter(function (x) {
+    var lim = +cfg.limits[x.sev] || 0;
+    if (lim > 0 && used[x.sev] >= lim) { over[x.sev]++; return false; }
+    used[x.sev]++; return true;
+  });
+  var sel = null;
+  for (var i = 0; i < list.length; i++) if (list[i].key === st.sel) { sel = list[i]; break; }
+  V = { all: all, vis: vis, sorted: sorted, list: list, over: over, sel: sel,
+    hasOver: SEVS.some(function (k) { return over[k]; }),
+    unlimited: st.showAll || SEVS.every(function (k) { return !(+cfg.limits[k] > 0); }) };
+  return V;
+}
+
+// ---------------------------------------------------------------- hash
+function hashOf() {
+  var p = new URLSearchParams(), j = function (o) { return Object.keys(o).filter(function (k) { return o[k]; }).join(','); };
+  if (st.q) p.set('q', st.q);
+  ['sev', 'mode', 'cat', 'rule'].forEach(function (k) { var v = j(st.f[k]); if (v) p.set(k, v); });
+  if (st.sort !== 'sev' || st.dir !== 1) p.set('sort', st.sort + (st.dir < 0 ? '-' : ''));
+  if (st.sel) p.set('sel', st.sel);
+  if (!cfg.group) p.set('g', '0');
+  if (cfg.hideWaived) p.set('hw', '1');
+  return p.toString();
+}
+function readHash() {
+  var hs = ''; try { hs = location.hash.slice(1); } catch (e) {}
+  if (!hs) return;
+  var p = new URLSearchParams(hs), obj = function (v) { var o = {}; (v || '').split(',').filter(Boolean).forEach(function (k) { o[k] = true; }); return o; };
+  var so = p.get('sort') || 'sev', key = so.replace(/-$/, '');
+  st.q = p.get('q') || ''; st.sel = p.get('sel') || null;
+  st.f = { sev: obj(p.get('sev')), mode: obj(p.get('mode')), cat: obj(p.get('cat')), rule: obj(p.get('rule')) };
+  st.sort = CMP[key] ? key : 'sev'; st.dir = so.slice(-1) === '-' ? -1 : 1;
+  cfg.group = p.get('g') !== '0'; cfg.hideWaived = p.get('hw') === '1';
+  st.showAll = false;
+  $('q').value = st.q;
+}
+var lastHash = null;
+function writeHash() {
+  var hs = hashOf();
+  if (hs === lastHash) return;
+  lastHash = hs;
+  try { history.replaceState(null, '', location.pathname + location.search + (hs ? '#' + hs : '')); } catch (e) {}
+}
+
+// ---------------------------------------------------------------- render
+var app = $('app');
+function applyTheme() {
+  app.className = 't-' + cfg.theme + (cfg.density === 'comfortable' ? ' comfy' : '') + (cfg.wrap ? ' wrap' : '');
+  app.style.fontSize = { S: '12px', M: '13px', L: '14.5px' }[cfg.size] || '13px';
+  var fb = '"Segoe UI",system-ui,-apple-system,sans-serif';
+  if (cfg.font !== 'theme' && FONTS.indexOf(cfg.font) >= 0) {
+    app.style.setProperty('--fh', '"' + cfg.font + '",' + fb);
+    app.style.setProperty('--fb', '"' + cfg.font + '",' + fb);
+    if (cfg.font === 'JetBrains Mono') app.style.setProperty('--fm', '"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace');
+    else app.style.removeProperty('--fm');
+  } else { app.style.removeProperty('--fh'); app.style.removeProperty('--fb'); app.style.removeProperty('--fm'); }
+  document.body.style.background = getComputedStyle(app).getPropertyValue('--bg');
+}
+function paneW() { return Math.max(260, Math.min(760, cfg.paneW || 340)); }
+function leftW() { return Math.max(120, Math.min(360, cfg.leftW || 160)); }
+function layout() {
+  var lw = leftW(), pw = paneW();
+  $('main').style.gridTemplateColumns = lw + 'px minmax(0,1fr)' + (cfg.pane ? ' ' + pw + 'px' : '');
+  $('rh-l').style.left = (lw - 3) + 'px';
+  $('rh-r').style.right = (pw - 3) + 'px';
+  $('rh-r').style.display = cfg.pane ? '' : 'none';
+  $('pane').style.display = cfg.pane ? '' : 'none';
+}
+function cols() { return '58px 72px 84px ' + (cfg.loc ? '150px ' : '') + 'minmax(0,1fr)'; }
+function modeText(x) {
+  var l = x.modeList;
+  if (l.length > 1 && modeNames.length > 1 && modeNames.every(function (m) { return l.indexOf(m) >= 0; })) return 'all';
+  return l.length > 2 ? l.length + ' modes' : l.join(', ');
+}
+function hrefOf(x) {
+  if (!x.file || cfg.open === 'copy') return '';
+  var p = String(x.file).replace(/\\/g, '/'); if (p.charAt(0) !== '/') p = '/' + p;
+  return cfg.open === 'vscode' ? 'vscode://file' + encodeURI(p) + (x.line ? ':' + x.line : '') : 'file://' + encodeURI(p);
+}
+function linkAttrs(x) {
+  var hr = hrefOf(x);
+  return (hr ? 'href="' + h(hr) + '" target="_blank" rel="noopener"' : 'href="#"') + ' data-act="open" data-key="' + h(x.key) + '"';
+}
+
+function renderHeader(v, W) {
+  $('top').textContent = TOP;
+  var vd = $('verdict');
+  vd.textContent = W.errLeft ? 'FAIL' : 'PASS';
+  vd.style.background = W.errLeft ? 'var(--err)' : 'var(--pass)';
+  vd.title = W.errLeft ? fmt(W.errLeft) + ' unwaived ERROR finding' + (W.errLeft > 1 ? 's' : '') : 'No unwaived ERROR findings';
+  var mc = modeNames.map(function (m) {
+    var k = { ERROR: 0, WARNING: 0, INFO: 0 }, n = 0;
+    v.vis.forEach(function (x) { if (x.modeList.indexOf(m) >= 0) { k[x.sev]++; n++; } });
+    return { m: m, k: k, n: n };
+  });
+  var maxN = Math.max.apply(null, [1].concat(mc.map(function (x) { return x.n; })));
+  $('strip').innerHTML = mc.map(function (x) {
+    var segs = SEVS.filter(function (s) { return x.k[s]; }).map(function (s) { return '<span style="width:' + (x.k[s] / maxN * 100) + '%;background:' + col(s) + '"></span>'; }).join('');
+    return '<button class="mc' + (st.f.mode[x.m] ? ' on' : '') + '" data-act="flip" data-dim="mode" data-v="' + h(x.m) + '" title="' + h(x.m) + ': ' + x.k.ERROR + ' ERROR, ' + x.k.WARNING + ' WARN, ' + x.k.INFO + ' INFO">' +
+      '<span class="l1"><b>' + h(x.m) + '</b><span style="color:' + (x.k.ERROR ? 'var(--err-t)' : 'var(--muted)') + '">' + x.k.ERROR + 'E ' + x.k.WARNING + 'W</span></span>' +
+      '<span class="bar">' + segs + '</span></button>';
+  }).join('');
+  var anyF = !!st.q || ['sev', 'mode', 'cat', 'rule'].some(function (k) { return has(st.f[k]); });
+  $('b-clear').classList.toggle('dim', !anyF);
+  var nW = v.all.filter(function (x) { return x.wv; }).length;
+  var hw = $('b-hw'); hw.classList.toggle('on', cfg.hideWaived);
+  hw.innerHTML = '<span class="sq' + (cfg.hideWaived ? ' on' : '') + '"></span>Hide waived<span class="n">' + fmt(nW) + '</span>';
+  $('b-bulk').classList.toggle('dim', !v.sorted.some(function (x) { return !x.wv; }));
+  var stale = W.nUnused + W.nRedundant;
+  $('b-w').innerHTML = 'Waivers<span class="n">' + WL.length + '</span>' + (stale ? '<span class="wdot" title="' + W.nUnused + ' unused, ' + W.nRedundant + ' redundant"></span>' : '');
+  $('b-link').innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>' + (st.linkCopied ? 'Copied' : 'Copy link');
+  $('b-pane').classList.toggle('on', cfg.pane);
+  $('b-menu').classList.toggle('on', st.menu);
+}
+
+function renderFacets(v) {
+  var f = st.f, vis = v.vis;
+  var count = function (fn) { var n = 0; for (var i = 0; i < vis.length; i++) if (fn(vis[i])) n++; return n; };
+  var item = function (dim, val, label, n, o) {
+    o = o || {}; var on = !!f[dim][val];
+    return '<button class="fi' + (on ? ' on' : '') + '" data-act="flip" data-dim="' + dim + '" data-v="' + h(val) + '" title="' + h(o.title || label) + '">' +
+      '<span class="cb" style="background:' + (on ? (o.fill || 'var(--accent)') : (o.idle || 'transparent')) + '"></span>' +
+      '<span class="fl' + (o.mono ? ' mono' : '') + '">' + h(label) + '</span><span class="fn">' + fmt(n) + '</span></button>';
+  };
+  var groups = [
+    ['Severity', 'sev', SEVS.map(function (s) { return item('sev', s, SL[s], count(function (x) { return x.sev === s; }), { fill: col(s), idle: tint(s) }); })],
+    ['Mode', 'mode', modeKeys.map(function (k) { return item('mode', k, k, count(function (x) { return x.modeList.indexOf(k) >= 0; })); })],
+    ['Category', 'cat', catKeys.map(function (c) { return item('cat', c, CATS[c] || c, count(function (x) { return x.cat === c; })); })],
+    ['Rule', 'rule', ruleList.map(function (r) { return item('rule', r.rule, r.rule, count(function (x) { return x.rule === r.rule; }), { mono: true, fill: col(r.sev), title: r.rule + ' · ' + r.title }); })]
+  ];
+  $('facets').innerHTML = groups.map(function (g) {
+    return '<div class="fg"><div class="fgt"><span>' + g[0] + '</span>' + (has(f[g[1]]) ? '<button class="lnk" data-act="clearDim" data-dim="' + g[1] + '">clear</button>' : '') + '</div>' + g[2].join('') + '</div>';
+  }).join('');
+}
+
+function rowHtml(x, style) {
+  var sel = V.sel && V.sel.key === x.key;
+  return '<div class="row' + (sel ? ' sel' : '') + (x.wv ? ' wv' : '') + '" data-act="sel" data-key="' + x.key + '" style="grid-template-columns:' + cols() + (style || '') + '">' +
+    '<span class="c c-sev" style="color:' + colT(x.sev) + '"><span class="dot" style="background:' + col(x.sev) + '"></span>' + SL[x.sev] + '</span>' +
+    '<span class="c c-rule">' + h(x.rule) + '</span>' +
+    '<span class="c c-mode" title="' + h(x.modeList.join(', ')) + '">' + h(modeText(x)) + '</span>' +
+    (cfg.loc ? (x.file ? '<a class="c c-loc" ' + linkAttrs(x) + ' title="' + h(x.file) + '">' + h(x.loc) + '</a>' : '<span class="c c-loc" style="color:var(--faint)">—</span>') : '') +
+    '<span class="c-msgw">' + (x.wv ? '<span class="wtag" title="' + h(x.wv.id) + '">WAIVED</span>' : '') + '<span class="c c-msg" title="' + h(x.msg) + '">' + h(x.msg) + '</span></span></div>';
+}
+var rowH = 0, winRange = null;
+function isWindowed() { return V.unlimited && !cfg.wrap && V.list.length > 400; }
+function listFooter() {
+  var out = '';
+  if (!V.list.length) out += '<div class="empty">Nothing matches the current filters.</div>';
+  if (!st.showAll && V.hasOver)
+    out += '<div class="over"><span>Not shown (row limit): ' + SEVS.filter(function (k) { return V.over[k]; }).map(function (k) { return fmt(V.over[k]) + ' ' + SL[k]; }).join(' · ') +
+      '</span><button class="lnk" data-act="showAll">Show all</button></div>';
+  return out;
+}
+function renderRows(force) {
+  var box = $('list'), L = V.list;
+  if (!isWindowed()) { winRange = null; box.innerHTML = L.map(function (x) { return rowHtml(x); }).join('') + listFooter(); return; }
+  if (!rowH || force) { box.innerHTML = rowHtml(L[0]); rowH = box.firstChild.offsetHeight || 26; }
+  var top = box.scrollTop, vh = box.clientHeight || 600;
+  var i0 = Math.max(0, Math.floor(top / rowH) - 50), i1 = Math.min(L.length, Math.ceil((top + vh) / rowH) + 50);
+  if (!force && winRange && winRange[0] === i0 && winRange[1] === i1) return;
+  winRange = [i0, i1];
+  var sty = ';height:' + rowH + 'px';
+  box.innerHTML = '<div style="height:' + (i0 * rowH) + 'px"></div>' + L.slice(i0, i1).map(function (x) { return rowHtml(x, sty); }).join('') +
+    '<div style="height:' + ((L.length - i1) * rowH) + 'px"></div>' + listFooter();
+  box.scrollTop = top;
+}
+function renderTable() {
+  var th = $('thead');
+  th.style.gridTemplateColumns = cols();
+  th.innerHTML = [['sev', 'Sev'], ['rule', 'Rule'], ['mode', cfg.group ? 'Modes' : 'Mode'], ['loc', 'Location'], ['msg', 'Message']]
+    .filter(function (c) { return cfg.loc || c[0] !== 'loc'; })
+    .map(function (c) { return '<button class="' + (st.sort === c[0] ? 'on' : '') + '" data-act="sort" data-k="' + c[0] + '">' + c[1] + (st.sort === c[0] ? (st.dir > 0 ? ' ↓' : ' ↑') : '') + '</button>'; }).join('');
+  rowH = 0; renderRows(true);
+}
+
+function srcLines(x) {
+  if (!x.file || !x.line) return null;
+  var text = SRC[x.file]; if (text == null) return null;
+  var lines = String(text).split('\n'), marks = lineSev[x.file] || {}, out = [];
+  for (var n = Math.max(1, x.line - 3); n <= x.line + 3; n++) {
+    var t = lines[n - 1]; if (t === undefined) continue;
+    var me = n === x.line, o = !me && marks[n];
+    out.push('<div style="background:' + (me ? tint(x.sev) : 'transparent') + ';font-weight:' + (me ? 600 : 400) + '"><span class="ln">' + n + '</span>' +
+      '<span class="sd" style="background:' + (o ? col(o) : 'transparent') + '"' + (o ? ' title="' + SL[o] + ' finding on this line"' : '') + '></span><span class="tx">' + (h(t) || ' ') + '</span></div>');
+  }
+  return out.length ? out.join('') : null;
+}
+function renderPane(v, W) {
+  var p = $('pane');
+  if (!cfg.pane) { p.innerHTML = ''; return; }
+  var x = v.sel;
+  if (!x) { p.innerHTML = '<div class="nosel">Select a finding to inspect it.</div>'; return; }
+  var aff = {}; (cfg.group ? x.modeList : groupOf[x.id].modeList).forEach(function (m) { aff[m] = 1; });
+  x.modeList.forEach(function (m) { aff[m] = 1; });
+  var wv = x.wv, src = srcLines(x), changed = x.defSev !== x.sev;
+  var o = [];
+  o.push('<div class="dp"><div class="dh"><span class="stag" title="' + (changed ? 'default ' + SL[x.defSev] : 'Default severity ' + SL[x.defSev]) + '" style="background:' + tint(x.sev) + ';color:' + colT(x.sev) + '">' + SL[x.sev] + '</span>' +
+    '<span class="mono" style="font-size:12px;font-weight:600">' + h(x.rule) + '</span><span style="font-size:11.5px;color:var(--faint)">' + h(CATS[x.cat] || x.cat) + '</span>' +
+    (changed ? '<span style="font-size:11px;color:var(--faint)">· default ' + SL[x.defSev] + '</span>' : '') + '</div>');
+  o.push('<div style="display:flex;flex-direction:column;gap:3px"><div class="dtitle">' + h(x.title) + '</div><div class="dmsg">' + h(x.msg) + '</div></div>');
+  o.push('<div class="kv"><span class="k">File</span><div style="display:flex;flex-direction:column;gap:1px;min-width:0">' +
+    (x.file ? '<a class="mono" style="font-size:12px;color:var(--accent-t);text-decoration:none" ' + linkAttrs(x) + ' title="' + (cfg.open === 'vscode' ? 'Open in VS Code' : cfg.open === 'copy' ? 'Copy path' : 'Open file') + '">' + h(x.loc) + '</a>' : '<span class="mono" style="font-size:12px">—</span>') +
+    '<span class="mono" style="font-size:10.5px;color:var(--faint);word-break:break-all">' + h(x.file || 'No source line (design-level or cross-mode check)') + '</span></div>' +
+    '<span class="k">Modes</span><div class="pills">' + modeKeys.map(function (k) {
+      return aff[k] ? '<span class="mp" style="background:' + tint(x.sev) + ';color:' + colT(x.sev) + ';border-color:' + col(x.sev) + '">' + h(k) + '</span>' : '<span class="mp">' + h(k) + '</span>';
+    }).join('') + '</div>' +
+    (x.objs.length ? '<span class="k">Objects</span><div class="pills">' + x.objs.map(function (b) { return '<span class="oc">' + h(b) + '</span>'; }).join('') + '</div>' : '') + '</div>');
+  if (src) o.push('<div style="display:flex;flex-direction:column;gap:4px"><div class="k">Source</div><div class="src">' + src + '</div></div>');
+  else if (x.cmd) o.push('<pre class="cmd">' + h(x.cmd) + '</pre>');
+  o.push('<div class="acts"><button class="hov" data-act="copyLoc">' + (st.copied ? 'Copied' : 'Copy file:line') + '</button><button class="hov" data-act="sameRule">Filter to ' + h(x.rule) + '</button></div>');
+  o.push('<div class="wsec"><div class="k">Waiver</div>');
+  if (wv) {
+    var meta = [wv.author, wv.created, wv.batch ? 'bulk ' + wv.batch : null].filter(Boolean).join(' · ') || 'no author';
+    o.push('<div class="wcard"><div class="a"><span class="mono" style="font-weight:600">' + h(wv.id) + '</span><span style="color:var(--muted)">' + h(SCOPES[wv.scope] || 'Custom match') + '</span></div>' +
+      (wv.reason ? '<div style="font-size:12.5px;line-height:1.4">' + h(wv.reason) + '</div>' : '') +
+      '<div class="m"><span>' + h(meta) + '</span><button class="lnk" data-act="unwaive" data-id="' + h(wv.id) + '">Remove</button></div></div>');
+  } else {
+    var lbl = { finding: 'Only this finding', file: 'All ' + x.rule + ' in ' + (x.fileBase || 'design checks'), rule: 'All ' + x.rule + ' everywhere' };
+    var tip = { finding: 'Matches rule + file + object + message; survives line-number changes', file: 'Matches every ' + x.rule + ' in this file', rule: 'Matches every ' + x.rule + ' in the block' };
+    o.push('<div style="display:flex;flex-direction:column;gap:3px">' + ['finding', 'file', 'rule'].map(function (k) {
+      var cw = compile(mk(x, k, null, 0)), n = 0;
+      F.forEach(function (y) { if (hit(cw, y)) n++; });
+      return '<button class="radio' + (st.wScope === k ? ' on' : '') + '" data-act="wScope" data-k="' + k + '" title="' + h(tip[k]) + '"><span class="rd"></span><span class="rl">' + h(lbl[k]) + '</span><span class="rn">' + n + (n === 1 ? ' finding' : ' findings') + '</span></button>';
+    }).join('') + '</div>');
+    o.push('<div class="wrow"><input id="wr" placeholder="Reason (optional)" value="' + h(st.wReason) + '"><button class="pri" data-act="waive">Waive</button></div>');
+  }
+  o.push('</div></div>');
+  p.innerHTML = o.join('');
+}
+
+function seg(key, opts) {
+  return '<div class="seg">' + opts.map(function (a) { return '<button class="' + (cfg[key] === a[0] ? 'on' : '') + '" data-act="cfg" data-k="' + key + '" data-v="' + a[0] + '">' + a[1] + '</button>'; }).join('') + '</div>';
+}
+function renderMenu() {
+  var w = $('menuwrap');
+  if (!st.menu) { w.innerHTML = ''; return; }
+  var toggles = [['loc', 'Location column', ''], ['wrap', 'Wrap long messages', ''], ['group', 'Group identical findings across modes', ''], ['pane', 'Detail pane', ']'], ['hideWaived', 'Hide waived findings', '']];
+  w.innerHTML = '<div class="bd" data-act="closeMenu"></div><div id="menu"><div style="display:flex;flex-direction:column">' +
+    toggles.map(function (t) { return '<button class="tg" data-act="tog" data-k="' + t[0] + '"><span class="sq' + (cfg[t[0]] ? ' on' : '') + '"></span><span>' + t[1] + '</span><span class="kbd">' + t[2] + '</span></button>'; }).join('') +
+    '</div><div class="sgrid">' +
+    '<span>Theme</span>' + seg('theme', [['industry', 'Industry'], ['router', 'Router']]) +
+    '<span>Font</span><select class="sel" data-cfg="font">' + FONTS.map(function (f) { return '<option value="' + h(f) + '"' + (cfg.font === f ? ' selected' : '') + '>' + (f === 'theme' ? 'Theme default' : h(f)) + '</option>'; }).join('') + '</select>' +
+    '<span>Density</span>' + seg('density', [['compact', 'Compact'], ['comfortable', 'Comfortable']]) +
+    '<span>Text size</span>' + seg('size', [['S', 'S'], ['M', 'M'], ['L', 'L']]) +
+    '<span title="Maximum rows shown per severity. 0 = no limit.">Row limit</span><div class="lims">' + SEVS.map(function (k) {
+      return '<label title="' + SL[k] + ' row limit"><i style="background:' + col(k) + '"></i><input type="number" min="0" step="50" value="' + (+cfg.limits[k] || 0) + '" data-lim="' + k + '"></label>';
+    }).join('') + '</div>' +
+    '<span>Open files</span><select class="sel" data-cfg="open">' + [['file', 'In browser (file://)'], ['vscode', 'In VS Code, at line'], ['copy', 'Copy path only']].map(function (a) { return '<option value="' + a[0] + '"' + (cfg.open === a[0] ? ' selected' : '') + '>' + a[1] + '</option>'; }).join('') + '</select>' +
+    '<span>Author</span><input class="inp" data-cfg="author" placeholder="for waivers" value="' + h(cfg.author) + '">' +
+    '</div><div class="mfoot"><span class="kbd">j k / ] esc</span><button class="lnk" style="margin-left:auto" data-act="exportCsv">Export CSV</button><button class="lnk" data-act="resetCfg">Reset</button></div></div>';
+}
+
+function bulkSets() {
+  var targets = V.sorted.filter(function (x) { return !x.wv; }), per = {}, keys = [];
+  targets.forEach(function (x) { var k = x.rule + '|' + (x.fileBase || ''); if (!per[k]) keys.push(k); per[k] = x; });
+  return { finding: targets, file: keys.map(function (k) { return per[k]; }) };
+}
+function statusRows(W) {
+  return WL.map(function (w, i) {
+    var target = w.scope === 'rule' ? 'Rule everywhere' : w.scope === 'file' ? 'Rule in ' + (w.file || 'design checks') :
+      [w.file || 'design', w.obj].filter(Boolean).join(' · ') + (w.msg ? ' · exact message' : '');
+    if (w.modes && w.modes.length) target += ' · modes ' + w.modes.join(', ');
+    return { w: w, target: target, n: W.m[i].length, k: W.status[i] };
+  });
+}
+function renderDlg(W) {
+  var d = $('dlg');
+  if (!st.dlg) { d.innerHTML = ''; return; }
+  if (st.dlg === 'bulk') {
+    var bs = bulkSets(), n = bs[st.bScope].length;
+    d.innerHTML = '<div class="dbd" data-act="closeDlg"></div><div class="dlg dlg-b" role="dialog" aria-label="Waive current view"><div class="dt">Waive current view</div>' +
+      '<div style="font-size:12.5px;color:var(--muted)">' + fmt(bs.finding.length) + ' unwaived findings match the current search and filters' + (st.showAll || !V.hasOver ? '.' : ', including rows past the row limit.') + '</div>' +
+      '<div style="display:flex;flex-direction:column;gap:3px">' + [['finding', 'One waiver per finding (exact match)'], ['file', 'One waiver per rule and file']].map(function (a) {
+        return '<button class="radio' + (st.bScope === a[0] ? ' on' : '') + '" data-act="bScope" data-k="' + a[0] + '"><span class="rd"></span><span>' + a[1] + '</span><span class="rn">' + fmt(bs[a[0]].length) + '</span></button>';
+      }).join('') + '</div>' +
+      '<input id="br" class="inp" style="height:30px;font-size:12.5px;padding:3px 9px" placeholder="Reason (optional, applied to all)" value="' + h(st.bReason) + '">' +
+      '<div style="display:flex;justify-content:flex-end;gap:6px;padding-top:4px"><button class="btn" style="font-size:12.5px;padding:0 12px" data-act="closeDlg">Cancel</button>' +
+      '<button class="pri" style="height:30px;font-size:12.5px;' + (n ? '' : 'opacity:.45') + '" data-act="doBulk">Waive ' + fmt(n) + '</button></div></div>';
+    return;
+  }
+  var all = statusRows(W), tab = st.wTab;
+  var list = all.filter(function (r) { return tab === 'all' || (tab === 'unused' ? (r.k === 'unused' || r.k === 'expired') : r.k === 'redundant'); });
+  var ST = { active: 'Active', unused: 'Unused', redundant: 'Redundant', expired: 'Expired' };
+  d.innerHTML = '<div class="dbd" data-act="closeDlg"></div><div class="dlg dlg-w" role="dialog" aria-label="Waivers"><div class="dwh"><span class="dt">Waivers</span>' +
+    '<div class="seg">' + [['all', 'All ' + all.length], ['unused', 'Unused ' + W.nUnused], ['redundant', 'Redundant ' + W.nRedundant]].map(function (a) {
+      return '<button class="' + (tab === a[0] ? 'on' : '') + '" data-act="wTab" data-k="' + a[0] + '">' + a[1] + '</button>';
+    }).join('') + '</div>' +
+    '<button class="b28 hov" style="margin-left:auto" data-act="exportW">Export</button>' +
+    '<label class="b28 hov">Import<input type="file" accept=".json,application/json" data-act="importW" style="display:none"></label>' +
+    '<button class="b28 hov" style="width:28px;padding:0;justify-content:center;font-size:15px" title="Close" data-act="closeDlg">×</button></div>' +
+    '<div class="wg hd"><span>ID</span><span>Rule</span><span>Scope · reason</span><span style="text-align:right">Matches</span><span>Status</span><span></span></div>' +
+    '<div style="flex:1;min-height:0;overflow-y:auto">' + list.map(function (r) {
+      return '<div class="wg"><span class="mono" style="font-size:11.5px">' + h(r.w.id) + '</span><span class="mono" style="font-size:11.5px">' + h(r.w.rule) + '</span>' +
+        '<span class="tt"><span title="' + h(r.target) + '">' + h(r.target) + '</span><span title="' + h(r.w.reason || '') + '">' + h(r.w.reason || '—') + '</span></span>' +
+        '<span class="mono" style="text-align:right;font-size:11.5px">' + r.n + '</span><span><span class="st st-' + r.k + '">' + ST[r.k] + '</span></span>' +
+        '<button class="xb" title="Remove waiver" data-act="unwaive" data-id="' + h(r.w.id) + '">×</button></div>';
+    }).join('') +
+    (list.length ? '' : '<div style="padding:22px 14px;color:var(--muted)">' + (tab === 'all' ? 'No waivers yet. Waive a finding from the detail pane, or use Waive view… for the current filter.' : 'None.') + '</div>') + '</div>' +
+    '<div class="dwf"><span style="flex:1;min-width:0">' + h(st.note || 'Unused: matches nothing in this run. Redundant: everything it matches is already covered by a broader or earlier waiver.') + '</span>' +
+    '<button class="b28 hov"' + (W.nUnused ? '' : ' style="opacity:.45"') + ' data-act="rmStatus" data-k="unused">Remove unused (' + W.nUnused + ')</button>' +
+    '<button class="b28 hov"' + (W.nRedundant ? '' : ' style="opacity:.45"') + ' data-act="rmStatus" data-k="redundant">Remove redundant (' + W.nRedundant + ')</button></div></div>';
+}
+
+function render() {
+  var W = waivers(), v = computeView();
+  applyTheme(); layout();
+  renderHeader(v, W); renderFacets(v); renderTable(); renderPane(v, W); renderMenu(); renderDlg(W);
+  writeHash();
+}
+
+// ---------------------------------------------------------------- actions
+function flash(key) { st[key] = true; render(); setTimeout(function () { st[key] = false; render(); }, 1200); }
+function rowByKey(k) { for (var i = 0; i < V.list.length; i++) if (V.list[i].key === k) return V.list[i]; return null; }
+function openFile(e, el) {
+  var x = rowByKey(el.getAttribute('data-key'));
+  if (!x || !x.file || cfg.open === 'copy') { e.preventDefault(); if (x && x.file) copyText(x.file + (x.line ? ':' + x.line : '')); }
+}
+function waiveSel() {
+  var x = V.sel; if (!x || x.wv) return;
+  var r = $('wr'); if (r) st.wReason = r.value;
+  var list = WL.concat([mk(x, st.wScope, st.wReason.trim(), nextN(WL))]);
+  st.wReason = ''; setW(list);
+}
+function doBulk() {
+  var set = bulkSets()[st.bScope]; if (!set.length) return;
+  var n = nextN(WL), batch = 'B-' + Date.now().toString(36).slice(-5), r = $('br');
+  if (r) st.bReason = r.value;
+  var add = set.map(function (x) { return mk(x, st.bScope, st.bReason.trim(), n++, batch); });
+  st.dlg = null; st.bReason = ''; setW(WL.concat(add));
+}
+function exportCsv() {
+  var q = function (v) { return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; };
+  var rows = [['severity', 'rule', 'modes', 'file', 'line', 'object', 'message', 'waiver']].concat(V.sorted.map(function (x) {
+    return [x.sev, x.rule, x.modeList.join(' '), x.file || '', x.line || '', x.obj || '', x.msg, x.wv ? x.wv.id : ''];
+  }));
+  dl(TOP + '.sdc_qc.view.csv', rows.map(function (r) { return r.map(q).join(','); }).join('\n') + '\n', 'text/csv');
+}
+function exportW() {
+  dl(TOP + '.sdc_qc.waivers.json', JSON.stringify({ schema: 'sdc_qc.waivers/1', top: TOP, exported: new Date().toISOString().replace(/\.\d+Z$/, 'Z'), waivers: WL }, null, 2) + '\n', 'application/json');
+}
+function importW(input) {
+  var file = input.files && input.files[0]; if (!file) return;
+  var rd = new FileReader();
+  rd.onload = function () {
+    input.value = '';
+    var doc; try { doc = JSON.parse(rd.result); } catch (err) { st.note = 'Not valid JSON.'; render(); return; }
+    var inc = Array.isArray(doc) ? doc : doc && doc.waivers;
+    if (!Array.isArray(inc)) { st.note = 'No "waivers" array found.'; render(); return; }
+    if (doc.schema && doc.schema !== 'sdc_qc.waivers/1') { st.note = 'Unknown schema ' + doc.schema + '.'; render(); return; }
+    var byId = {}, order = [];
+    WL.forEach(function (w) { byId[w.id] = w; order.push(w.id); });
+    var n = nextN(WL.concat(inc.filter(function (w) { return w && w.id; }))), added = 0;
+    inc.filter(function (w) { return w && w.rule; }).forEach(function (w) {
+      var id = w.id || wid(n++);
+      if (!byId[id]) { added++; order.push(id); }
+      byId[id] = Object.assign({}, w, { id: id });
+    });
+    st.note = 'Imported ' + inc.length + ' (' + added + ' new)' + (doc.top && doc.top !== TOP ? ' · warning: file is for top ' + doc.top : '');
+    setW(order.map(function (id) { return byId[id]; }));
+  };
+  rd.readAsText(file);
+}
+function clearAll() { st.q = ''; $('q').value = ''; st.f = emptyF(); st.showAll = false; render(); }
+function scrollToSel() {
+  var box = $('list'), i = -1;
+  for (var j = 0; j < V.list.length; j++) if (V.list[j].key === st.sel) { i = j; break; }
+  if (i < 0) return;
+  var top, hgt;
+  if (winRange) { top = i * rowH; hgt = rowH; }
+  else { var row = box.querySelector('[data-key="' + st.sel + '"]'); if (!row) return; top = row.offsetTop; hgt = row.offsetHeight; }
+  if (top < box.scrollTop) box.scrollTop = top;
+  else if (top + hgt > box.scrollTop + box.clientHeight) box.scrollTop = top + hgt - box.clientHeight;
+  if (winRange) renderRows(false);
+}
+
+var ACT = {
+  flip: function (el) { var d = el.getAttribute('data-dim'), v = el.getAttribute('data-v'); st.f[d][v] = !st.f[d][v]; st.showAll = false; render(); },
+  clearDim: function (el) { st.f[el.getAttribute('data-dim')] = {}; st.showAll = false; render(); },
+  clearAll: clearAll,
+  hideWaived: function () { setCfg({ hideWaived: !cfg.hideWaived }); },
+  openBulk: function () { st.dlg = 'bulk'; st.menu = false; render(); var r = $('br'); if (r) r.focus(); },
+  openWaivers: function () { st.dlg = 'waivers'; st.menu = false; st.note = ''; render(); },
+  closeDlg: function () { st.dlg = null; render(); },
+  copyLink: function () { copyText(location.href); flash('linkCopied'); },
+  pane: function () { setCfg({ pane: !cfg.pane }); },
+  menu: function () { st.menu = !st.menu; render(); },
+  closeMenu: function () { st.menu = false; render(); },
+  tog: function (el) { var k = el.getAttribute('data-k'), p = {}; p[k] = !cfg[k]; if (k === 'group') st.sel = null; setCfg(p); },
+  cfg: function (el) { var p = {}; p[el.getAttribute('data-k')] = el.getAttribute('data-v'); setCfg(p); },
+  resetCfg: function () { try { localStorage.removeItem(CFG_KEY); } catch (e) {} cfg = initCfg(); render(); },
+  exportCsv: exportCsv,
+  sort: function (el) { var k = el.getAttribute('data-k'); st.dir = st.sort === k ? -st.dir : 1; st.sort = k; render(); },
+  sel: function (el) { st.sel = el.getAttribute('data-key'); render(); },
+  showAll: function () { st.showAll = true; render(); },
+  copyLoc: function () { var x = V.sel; if (!x) return; copyText(x.loc + '  ' + x.rule + '  ' + x.msg); flash('copied'); },
+  sameRule: function () { var x = V.sel; if (!x) return; st.f.rule = {}; st.f.rule[x.rule] = true; st.showAll = false; render(); },
+  wScope: function (el) { var r = $('wr'); if (r) st.wReason = r.value; st.wScope = el.getAttribute('data-k'); render(); },
+  waive: waiveSel,
+  unwaive: function (el) { var id = el.getAttribute('data-id'); setW(WL.filter(function (w) { return w.id !== id; })); },
+  bScope: function (el) { var r = $('br'); if (r) st.bReason = r.value; st.bScope = el.getAttribute('data-k'); render(); },
+  doBulk: doBulk,
+  wTab: function (el) { st.wTab = el.getAttribute('data-k'); render(); },
+  exportW: exportW,
+  rmStatus: function (el) {
+    var k = el.getAttribute('data-k'), ks = k === 'unused' ? ['unused', 'expired'] : ['redundant'], W = waivers(), bad = {};
+    WL.forEach(function (w, i) { if (ks.indexOf(W.status[i]) >= 0) bad[w.id] = 1; });
+    setW(WL.filter(function (w) { return !bad[w.id]; }));
+  }
+};
+
+document.addEventListener('click', function (e) {
+  var el = e.target.closest('[data-act]'); if (!el || !app.contains(el)) return;
+  var a = el.getAttribute('data-act');
+  if (a === 'open') { openFile(e, el); return; }
+  if (a === 'importW') return;
+  if (ACT[a]) ACT[a](el, e);
+});
+document.addEventListener('change', function (e) {
+  var t = e.target;
+  if (t.getAttribute('data-act') === 'importW') { importW(t); return; }
+  var k = t.getAttribute('data-cfg');
+  if (k) { var p = {}; p[k] = t.value; setCfg(p); return; }
+  var lim = t.getAttribute('data-lim');
+  if (lim) { var l = Object.assign({}, cfg.limits); l[lim] = Math.max(0, parseInt(t.value, 10) || 0); st.showAll = false; setCfg({ limits: l }); }
+});
+document.addEventListener('input', function (e) {
+  var t = e.target;
+  if (t.id === 'q') { st.q = t.value; st.showAll = false; render(); }
+  else if (t.id === 'wr') st.wReason = t.value;
+  else if (t.id === 'br') st.bReason = t.value;
+});
+document.addEventListener('keydown', function (e) {
+  var t = e.target;
+  if (e.key === 'Enter' && t.id === 'wr') { e.preventDefault(); waiveSel(); return; }
+  if (e.key === 'Enter' && t.id === 'br') { e.preventDefault(); doBulk(); return; }
+});
+window.addEventListener('keydown', function (e) {
+  var ae = document.activeElement, typing = ae && /INPUT|TEXTAREA|SELECT/.test(ae.tagName);
+  if (e.key === 'Escape') {
+    if (st.dlg) { st.dlg = null; render(); return; }
+    if (st.menu) { st.menu = false; render(); return; }
+    if (typing) { ae.blur(); return; }
+    clearAll(); return;
+  }
+  if (typing || e.metaKey || e.ctrlKey || e.altKey || st.dlg) return;
+  if (e.key === '/') { e.preventDefault(); $('q').focus(); $('q').select(); return; }
+  if (e.key === ']') { setCfg({ pane: !cfg.pane }); return; }
+  if (e.key !== 'j' && e.key !== 'k') return;
+  var L = V.list; if (!L.length) return;
+  var i = -1; for (var j = 0; j < L.length; j++) if (L[j].key === st.sel) { i = j; break; }
+  st.sel = L[Math.max(0, Math.min(L.length - 1, i + (e.key === 'j' ? 1 : -1)))].key;
+  render(); scrollToSel();
+});
+$('list').addEventListener('scroll', function () {
+  if (!winRange) return;
+  if (this._raf) return;
+  var self = this; this._raf = requestAnimationFrame(function () { self._raf = 0; renderRows(false); });
+});
+// pane resize
+document.addEventListener('mousedown', function (e) {
+  var el = e.target.closest('[data-drag]'); if (!el) return;
+  e.preventDefault();
+  var key = el.getAttribute('data-drag'), x0 = e.clientX, w0 = key === 'leftW' ? leftW() : paneW(), dirn = key === 'leftW' ? 1 : -1;
+  var lo = key === 'leftW' ? 120 : 260, hi = key === 'leftW' ? 360 : 760;
+  var mv = function (ev) { cfg[key] = Math.max(lo, Math.min(hi, w0 + (ev.clientX - x0) * dirn)); layout(); };
+  var up = function () {
+    window.removeEventListener('mousemove', mv); window.removeEventListener('mouseup', up);
+    document.body.style.cursor = ''; document.body.style.userSelect = ''; save(CFG_KEY, cfg); if (winRange) renderRows(true);
+  };
+  document.body.style.cursor = 'col-resize'; document.body.style.userSelect = 'none';
+  window.addEventListener('mousemove', mv); window.addEventListener('mouseup', up);
+});
+window.addEventListener('hashchange', function () { readHash(); render(); });
+window.addEventListener('resize', function () { if (winRange) renderRows(false); });
+
+document.title = 'sdc_qc · ' + TOP;
+readHash();
+render();
+})();
+</script>
+</body>
+</html>
+'''  # end HTML_TEMPLATE
+
+
+def write_reports(out_dir, findings, summary, waivers=(), wstatus=(), sources=None,
+                  html=True, fonts_url=None):
     if not os.path.isdir(out_dir):
         os.makedirs(out_dir)
     findings = sorted(findings, key=lambda f: (f.mode != "*", f.mode, _SEV_RANK[f.sev], f.rule,
@@ -3859,11 +4880,22 @@ def write_reports(out_dir, findings, summary):
     import csv
     with open(os.path.join(out_dir, "sdc_qc.csv"), "w") as fh:
         w = csv.writer(fh)
-        w.writerow(["rule", "severity", "mode", "file", "line", "command", "objects", "message"])
+        w.writerow(["rule", "severity", "mode", "file", "line", "command", "objects", "message",
+                    "waiver"])
         for f in findings:
-            w.writerow([f.rule, f.sev, f.mode, f.file, f.line, f.cmd, f.obj, f.msg])
+            w.writerow([f.rule, f.sev, f.mode, f.file, f.line, f.cmd, f.obj, f.msg, f.waiver or ""])
+    doc = collections.OrderedDict([
+        ("summary", summary), ("findings", [f.as_dict() for f in findings]),
+        ("rules", collections.OrderedDict((k, list(v)) for k, v in RULES.items())),
+        ("waivers", list(waivers))])
+    if sources is not None:
+        doc["sources"] = sources
     with open(os.path.join(out_dir, "sdc_qc.json"), "w") as fh:
-        json.dump({"summary": summary, "findings": [f.as_dict() for f in findings]}, fh, indent=1)
+        json.dump(doc, fh, indent=1)
+    if html:
+        write_html(os.path.join(out_dir, "sdc_qc.html"), doc, fonts_url)
+    n_waived = collections.Counter(f.sev for f in findings if f.waiver)
+    unwaived_err = sum(1 for f in findings if f.sev == SEV_ERROR and not f.waiver)
     L = []
     L.append("SDC QC report  (sdc_qc %s)  %s" % (VERSION, time.strftime("%Y-%m-%d %H:%M:%S")))
     L.append("=" * 100)
@@ -3883,12 +4915,17 @@ def write_reports(out_dir, findings, summary):
         for p in sorted(short_name, key=lambda p: short_name[p]):
             L.append("  %-30s %s" % (short_name[p], p))
         L.append("")
+    if waivers:
+        wfiles = summary.get("waivers", {}).get("files", [])
+        L.append("Waivers: %d loaded from %s; %d finding(s) waived; %d unwaived ERROR" % (
+            len(waivers), ", ".join(wfiles) or "-", sum(n_waived.values()), unwaived_err))
+        L.append("")
     L.append("Summary (count of findings)")
     modes = [m["name"] for m in summary["modes"]] + (["*"] if any(f.mode == "*" for f in findings) else [])
-    L.append("  %-10s" % "severity" + "".join("%12s" % m[:12] for m in modes))
+    L.append("  %-10s" % "severity" + "".join("%12s" % m[:12] for m in modes) + "%12s" % "Waived")
     for sev in (SEV_ERROR, SEV_WARNING, SEV_INFO):
         L.append("  %-10s" % sev + "".join("%12d" % sum(1 for f in findings if f.sev == sev and f.mode == m)
-                                           for m in modes))
+                                           for m in modes) + "%12d" % n_waived.get(sev, 0))
     L.append("")
     L.append("By rule")
     cnt = collections.Counter((f.rule, f.sev) for f in findings)
@@ -3904,12 +4941,31 @@ def write_reports(out_dir, findings, summary):
                 continue
             fshort = short_name.get(f.file, f.file)
             where = ("%s:%d" % (fshort, f.line) if f.line else fshort) if f.file else ""
-            L.append("%-7s %-9s %s %s" % (f.sev, f.rule, where, f.msg))
+            wtag = "[waived %s] " % f.waiver if f.waiver else ""
+            L.append("%-7s %-9s %s %s%s" % (f.sev, f.rule, where, wtag, f.msg))
             if f.cmd:
                 L.append("        cmd: %s" % f.cmd)
             if f.obj:
                 o = f.obj if len(f.obj) < 600 else f.obj[:600] + " ...(see csv/json)"
                 L.append("        obj: %s" % o)
+    if waivers:
+        L.append("")
+        L.append("-" * 100)
+        L.append("Waivers: unused / redundant")
+        L.append("-" * 100)
+        n_active = sum(1 for st, _ in wstatus if st == "active")
+        bad = [(w, st, n) for w, (st, n) in zip(waivers, wstatus) if st != "active"]
+        L.append("%d active, %d unused, %d redundant, %d expired" % (
+            n_active, sum(1 for _, st, _ in bad if st == "unused"),
+            sum(1 for _, st, _ in bad if st == "redundant"),
+            sum(1 for _, st, _ in bad if st == "expired")))
+        for w, st, n in bad:
+            match = " ".join("%s=%s" % (k, w[k] if k != "modes" else ",".join(w[k]))
+                             for k in ("file", "obj", "msg", "modes") if w.get(k) is not None)
+            L.append("%-10s %-9s %-10s %-9s %s" % (st.upper(), w["id"], w["rule"],
+                                                   w.get("scope") or "-", match or "(any)"))
+            if w.get("reason"):
+                L.append("        reason: %s" % w["reason"])
     L.append("")
     L.append("Timing (s): " + ", ".join("%s=%.1f" % kv for kv in summary["timing"].items()))
     with open(os.path.join(out_dir, "sdc_qc.rpt"), "w") as fh:
@@ -4018,8 +5074,23 @@ def main(argv=None):
                     help="example objects listed per finding (default 20)")
     ap.add_argument("-no_clock_trace", action="store_true",
                     help="skip the register clock-pin coverage trace")
+    ap.add_argument("-waivers", action="append", default=[], metavar="FILE",
+                    help="waiver file(s) (schema %s); waived ERRORs do not fail the run"
+                         % WAIVER_SCHEMA)
+    ap.add_argument("-no_html", action="store_true", help="do not write sdc_qc.html")
+    ap.add_argument("-html_sources", dest="html_sources", action="store_true", default=True,
+                    help="embed SDC file text for the HTML source view (default)")
+    ap.add_argument("-no_html_sources", dest="html_sources", action="store_false",
+                    help="do not embed SDC file text")
+    ap.add_argument("-html_source_max_kb", type=int, default=2048, metavar="N",
+                    help="per-file embed cap; larger files keep +-20 lines around each "
+                         "finding (default 2048, 0 = no cap)")
+    ap.add_argument("-html_fonts_url", metavar="URL",
+                    help="optional stylesheet URL for the report fonts (default: offline "
+                         "system font stack)")
     ap.add_argument("-version", action="version", version="sdc_qc " + VERSION)
     opts = ap.parse_args(argv)
+    waivers = load_waivers(opts.waivers)
     opts.netlist = [x for grp in opts.netlist for x in grp]
     opts.search_path = [x for grp in opts.search_path for x in grp]
     libs = [x for grp in opts.lib for x in grp]
@@ -4087,12 +5158,20 @@ def main(argv=None):
                    "coverage": l["coverage"], "seconds": round(l["seconds"], 2)} for l in lites],
         "timing": timing,
         "counts": dict(collections.Counter(f.sev for f in findings)),
+        "waivers": {"files": [os.path.abspath(p) for p in opts.waivers], "count": len(waivers)},
     }
-    write_reports(opts.out_dir, findings, summary)
+    wstatus = apply_waivers(findings, waivers)
+    sources = (collect_sources(findings, summary, opts.html_source_max_kb)
+               if opts.html_sources else None)
+    write_reports(opts.out_dir, findings, summary, waivers, wstatus, sources,
+                  html=not opts.no_html, fonts_url=opts.html_fonts_url)
     c = summary["counts"]
-    _log("done: %d error(s), %d warning(s), %d info -> %s/sdc_qc.rpt" % (
-        c.get(SEV_ERROR, 0), c.get(SEV_WARNING, 0), c.get(SEV_INFO, 0), opts.out_dir))
-    return 1 if c.get(SEV_ERROR, 0) else 0
+    n_waived = sum(1 for f in findings if f.waiver)
+    unwaived_err = sum(1 for f in findings if f.sev == SEV_ERROR and not f.waiver)
+    _log("done: %d error(s) (%d unwaived), %d warning(s), %d info, %d waived -> %s/sdc_qc.rpt" % (
+        c.get(SEV_ERROR, 0), unwaived_err, c.get(SEV_WARNING, 0), c.get(SEV_INFO, 0), n_waived,
+        opts.out_dir))
+    return 1 if unwaived_err else 0
 
 
 if __name__ == "__main__":

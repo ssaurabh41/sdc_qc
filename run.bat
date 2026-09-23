@@ -23,13 +23,14 @@ rem   MODES     one  -mode "<mode>:<VAR>=<value>:<file.sdc>[:<incr.sdc>...]"  pe
 rem             STA mode. VAR=value is set before the files that follow it;
 rem             files are sourced left to right. Drive letters are fine:
 rem               -mode "func:D:\proj\sdc\foo.sdc"
-rem   OUT_DIR   report directory (sdc_qc.rpt, sdc_qc.csv, sdc_qc.json)
+rem   OUT_DIR   report directory (sdc_qc.rpt, .csv, .json and the sdc_qc.html dashboard)
 rem   JOBS      parallel processes (Liberty parsing; netlist and modes run
 rem             serially on Windows)
 rem   Paths containing spaces must be quoted, e.g. "C:\my libs\std.lib".
 rem
 rem EXIT STATUS
-rem   0 = no ERROR findings, 1 = ERROR findings present, 2 = tool/usage error
+rem   0 = no unwaived ERROR findings, 1 = unwaived ERROR findings present,
+rem   2 = tool/usage error. Waivers: run.bat -waivers blk.sdc_qc.waivers.json
 rem
 rem All options: py -3 sdc_qc.py -h      Documentation: README.md
 rem ===========================================================================
@@ -54,5 +55,5 @@ if not "%TOP%"=="" set "TOPARG=-top %TOP%"
 echo sdc_qc: %PYTHON% "%HERE%sdc_qc.py" %TOPARG% -netlist %NETLISTS% -lib %LIBS% %BLACKBOX% %MODES% -out_dir "%OUT_DIR%" -jobs %JOBS% %*
 %PYTHON% "%HERE%sdc_qc.py" %TOPARG% -netlist %NETLISTS% -lib %LIBS% %BLACKBOX% %MODES% -out_dir "%OUT_DIR%" -jobs %JOBS% %*
 set RC=%ERRORLEVEL%
-echo sdc_qc: exit status %RC% (0 clean, 1 ERROR findings, 2 tool error); report: %OUT_DIR%\sdc_qc.rpt
+echo sdc_qc: exit status %RC% (0 clean, 1 unwaived ERROR findings, 2 tool error); report: %OUT_DIR%\sdc_qc.rpt, dashboard: %OUT_DIR%\sdc_qc.html
 endlocal & exit /b %RC%

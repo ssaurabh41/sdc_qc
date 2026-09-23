@@ -53,12 +53,47 @@ Results are written to `sdc_qc_out/`:
 
 | File | Content |
 |---|---|
-| `sdc_qc.rpt` | Readable report: summary by mode and severity, counts by rule, then every finding with `file:line`, the command and the objects |
-| `sdc_qc.csv` | One row per finding: rule, severity, mode, file, line, command, objects, message |
-| `sdc_qc.json` | Same findings plus a run summary (clock counts, clock-pin coverage, runtimes) |
+| `sdc_qc.rpt` | Readable report: summary by mode and severity (plus a Waived column), counts by rule, then every finding with `file:line`, the command and the objects; waived findings are marked `[waived W-0001]` |
+| `sdc_qc.csv` | One row per finding: rule, severity, mode, file, line, command, objects, message, waiver |
+| `sdc_qc.json` | Same findings (each with its `waiver` id or `null`) plus a run summary (clock counts, clock-pin coverage, runtimes), the rule catalogue, the applied waivers and the SDC source text |
+| `sdc_qc.html` | Interactive dashboard (see below). One self-contained file: open it from disk, no server or network needed |
 
-Exit status: `0` means no ERROR findings, `1` means ERROR findings are present,
-and `2` means a tool or usage error (missing file, bad option, internal error).
+Exit status: `0` means no *unwaived* ERROR findings, `1` means unwaived ERROR
+findings are present, and `2` means a tool or usage error (missing file, bad
+option, bad `-waivers` file, internal error).
+
+## Dashboard and waivers
+
+`sdc_qc.html` is a triage workbench: facets (severity, mode, category, rule) on
+the left, the findings table in the middle, and a detail pane on the right with
+the SDC source excerpt and waiver controls. Identical findings across modes are
+grouped into one row. Keys: `j`/`k` move, `/` searches, `]` toggles the pane,
+`Esc` clears. The view (search, filters, sort, selection) is kept in the URL, so
+**Copy link** shares an exact view. Settings (theme, density, row limits, how file
+links open, author) are remembered per browser.
+
+Waivers created in the page are kept in the browser. Use **Waivers → Export** to
+save them as `<top>.sdc_qc.waivers.json`, then pass that file back:
+
+```tcsh
+./run.sh -waivers blk_top.sdc_qc.waivers.json
+```
+
+Waiver file format (`sdc_qc.waivers/1`): a waiver matches a finding when `rule`
+is equal and each of `file` (basename glob, `*`/`?`; `null` = any file, `""` =
+no file), `obj` (glob), `msg` (exact) and `modes` (list; `"cross-mode"` for the
+cross-mode checks) is either `null` or matches. Line numbers are not matched, so
+waivers survive edits. `expires` (ISO date) is optional. The report lists
+**unused** waivers (match nothing) and **redundant** ones (everything they match
+is already covered by a broader or earlier waiver).
+
+| Option | Meaning |
+|---|---|
+| `-waivers FILE` | Apply a waiver file (repeatable). Bad JSON or schema is a tool error (exit 2). |
+| `-no_html` | Do not write `sdc_qc.html`. |
+| `-no_html_sources` | Do not embed the SDC text (the detail pane then shows only the command). |
+| `-html_source_max_kb N` | Per-file embed cap (default 2048). Larger files keep only ±20 lines around each finding. |
+| `-html_fonts_url URL` | Add a stylesheet `<link>` for web fonts (the default page uses local fonts only). |
 
 ## Modes
 
@@ -299,7 +334,7 @@ python3 sdc_qc.py -netlist tests/data/bench.v -lib tests/data/cells.lib -mode "f
 python3 tests/test_sdc_qc.py -v
 ```
 
-28 tests cover:
+38 tests cover:
 
 * Liberty extraction, including CCS/LVF groups, `test_cell`, buses,
   multi-name pins, gzip, a 7-byte read chunk that exercises every
@@ -314,3 +349,6 @@ python3 tests/test_sdc_qc.py -v
 * Equality of the serial and parallel paths, for both netlist elaboration
   and modes.
 * The clean benchmark: zero findings and every clock pin reached.
+* Waivers: matching (globs, modes, cross-mode, expiry), unused/redundant
+  classification, bad waiver files (exit 2), exit 0 when every ERROR is
+  waived, and the embedded data block of `sdc_qc.html`.

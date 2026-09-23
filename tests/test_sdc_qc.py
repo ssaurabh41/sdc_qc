@@ -447,5 +447,95 @@ class ModeSpecTests(unittest.TestCase):
                          ["x", "d[2:0]", "d[5]"])
 
 
+class WaiverTests(unittest.TestCase):
+    MODES = ["mode1:SDC_MODE=mode1:%s:%s" % (D("foo.nondft.sdc"), D("bar.sdc")),
+             "mode2:SDC_MODE=mode2:%s" % D("foo.nondft.sdc"),
+             "dft:%s" % D("foo.dft.sdc")]
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sdcqc_w_")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def wfile(self, waivers, schema="sdc_qc.waivers/1"):
+        p = os.path.join(self.tmp, "w%d.json" % len(os.listdir(self.tmp)))
+        with open(p, "w") as fh:
+            json.dump({"schema": schema, "top": "foo", "waivers": waivers}, fh)
+        return p
+
+    def run_w(self, extra):
+        out = os.path.join(self.tmp, "out")
+        argv = ["-netlist", D("foo.v"), D("sub.v"), "-lib", D("cells.lib"), "-out_dir", out,
+                "-no_cache", "-jobs", "1"]
+        for m in self.MODES:
+            argv += ["-mode", m]
+        rc = sdc_qc.main(argv + list(extra))
+        with open(os.path.join(out, "sdc_qc.json")) as fh:
+            return rc, json.load(fh), out
+
+    def test_all_errors_waived_exit_0(self):
+        rc, res, _ = self.run_w([])
+        self.assertEqual(rc, 1)
+        err_rules = sorted(set(f["rule"] for f in res["findings"] if f["sev"] == "ERROR"))
+        ws = [{"id": "W-%04d" % (i + 1), "rule": r, "scope": "rule"} for i, r in enumerate(err_rules)]
+        rc, res, out = self.run_w(["-waivers", self.wfile(ws)])
+        self.assertEqual(rc, 0)
+        for f in res["findings"]:
+            self.assertEqual(f["waiver"] is not None, f["sev"] == "ERROR", f)
+        self.assertEqual(res["summary"]["waivers"]["count"], len(ws))
+        with open(os.path.join(out, "sdc_qc.rpt")) as fh:
+            rpt = fh.read()
+        self.assertIn("[waived W-", rpt)
+        self.assertIn("Waivers: unused / redundant", rpt)
+        with open(os.path.join(out, "sdc_qc.csv")) as fh:
+            self.assertTrue(fh.readline().rstrip().endswith(",waiver"))
+        with open(os.path.join(out, "sdc_qc.html")) as fh:
+            page = fh.read()
+        data = page.split('<script id="sdc-data" type="application/json">', 1)[1].split("</script>", 1)[0]
+        self.assertNotIn("<", data)
+        self.assertEqual(json.loads(data)["findings"], res["findings"])
+        self.assertIn(D("foo.nondft.sdc"), json.loads(data)["sources"])
+
+    def test_matching_and_status(self):
+        today = sdc_qc._utc_today()
+        F = sdc_qc.Finding
+        fs = [F("IO-001", "WARNING", "m1", "/a/blk.io.sdc", 3, "c", "p1", "msg1"),
+              F("IO-001", "WARNING", "m2", "/a/blk.io.sdc", 9, "c", "p1", "msg1"),
+              F("IO-001", "WARNING", "*", "", 0, "", "p2", "msg2"),
+              F("CLK-001", "WARNING", "m1", "/b/x.sdc", 1, "c", "CLK", "m")]
+        ws = [{"id": "W-1", "rule": "IO-001", "scope": "finding", "file": "blk.io.sdc", "obj": "p1",
+               "msg": "msg1", "modes": ["m2"]},
+              {"id": "W-2", "rule": "IO-001", "scope": "file", "file": "blk.*.sdc"},
+              {"id": "W-3", "rule": "IO-001", "scope": "finding", "file": "", "obj": "p?",
+               "modes": ["cross-mode"]},
+              {"id": "W-4", "rule": "IO-001", "scope": "finding", "file": "blk.io.sdc", "obj": "p1",
+               "msg": "msg1"},
+              {"id": "W-5", "rule": "CLK-001", "scope": "rule", "expires": "2000-01-01"},
+              {"id": "W-6", "rule": "EXC-001", "scope": "rule"}]
+        st = sdc_qc.apply_waivers(fs, ws)
+        self.assertEqual([f.waiver for f in fs], ["W-2", "W-1", "W-3", None])
+        self.assertEqual([s for s, _ in st],
+                         ["redundant", "active", "active", "redundant", "expired", "unused"])
+        self.assertLess("2000-01-01", today)
+
+    def test_bad_waiver_file_exit_2(self):
+        with self.assertRaises(SystemExit) as cm:
+            sdc_qc.load_waivers([self.wfile([], schema="other/1")])
+        self.assertEqual(cm.exception.code, 2)
+        bad = os.path.join(self.tmp, "bad.json")
+        with open(bad, "w") as fh:
+            fh.write("{not json")
+        with self.assertRaises(SystemExit) as cm:
+            sdc_qc.load_waivers([bad])
+        self.assertEqual(cm.exception.code, 2)
+        ws = sdc_qc.load_waivers([self.wfile([{"id": "W-0007", "rule": "A-1"}, {"rule": "B-1"}])])
+        self.assertEqual([w["id"] for w in ws], ["W-0007", "W-0008"])
+
+    def test_no_html(self):
+        _, _, out = self.run_w(["-no_html", "-no_html_sources"])
+        self.assertFalse(os.path.exists(os.path.join(out, "sdc_qc.html")))
+
+
 if __name__ == "__main__":
     unittest.main()

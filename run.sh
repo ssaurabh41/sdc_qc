@@ -27,11 +27,12 @@
 #               "mode1:SDC_MODE=mode1:foo.nondft.sdc"
 #               "mode2:SDC_MODE=mode2:foo.nondft.sdc:bar.sdc"
 #               "dft:foo.dft.sdc"
-#   OUT_DIR   report directory (sdc_qc.rpt, sdc_qc.csv, sdc_qc.json)
+#   OUT_DIR   report directory (sdc_qc.rpt, .csv, .json and the sdc_qc.html dashboard)
 #   JOBS      parallel processes (Liberty parsing, netlist, modes)
 #
 # EXIT STATUS
-#   0 = no ERROR findings, 1 = ERROR findings present, 2 = tool/usage error
+#   0 = no unwaived ERROR findings, 1 = unwaived ERROR findings present,
+#   2 = tool/usage error. Waivers: ./run.sh -waivers blk.sdc_qc.waivers.json
 #
 # All options: python3 sdc_qc.py -h      Documentation: README.md
 #==============================================================================
@@ -70,5 +71,5 @@ end
 echo "sdc_qc: $PYTHON $script_dir/sdc_qc.py $args:q $argv:q"
 $PYTHON $script_dir/sdc_qc.py $args:q $argv:q
 set rc = $status
-echo "sdc_qc: exit status $rc (0 clean, 1 ERROR findings, 2 tool error); report: $OUT_DIR/sdc_qc.rpt"
+echo "sdc_qc: exit status $rc (0 clean, 1 unwaived ERROR findings, 2 tool error); report: $OUT_DIR/sdc_qc.rpt, dashboard: $OUT_DIR/sdc_qc.html"
 exit $rc
