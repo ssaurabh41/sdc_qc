@@ -108,6 +108,7 @@ RULES = collections.OrderedDict([
     ("IO-006", (SEV_WARNING, "I/O delay has -max but no -min (or vice versa)")),
     ("IO-007", (SEV_WARNING, "Input port without driving cell / drive / input transition")),
     ("IO-008", (SEV_WARNING, "Output port without set_load")),
+    ("IO-009", (SEV_INFO, "I/O delay on internal pin (not modelled)")),
     ("EXC-001", (SEV_WARNING, "-from object is not a valid timing startpoint")),
     ("EXC-002", (SEV_WARNING, "-to object is not a valid timing endpoint")),
     ("EXC-003", (SEV_WARNING, "Setup multicycle without matching hold multicycle")),
@@ -962,6 +963,7 @@ class Design(object):
         return out
 
 
+_HAS_FORK = hasattr(os, "fork")    # no fork (Windows): elaborate serially
 _PAR_ELAB_BYTES = 16 * 1024 * 1024     # module bodies larger than this parse in parallel
 
 
@@ -1213,7 +1215,7 @@ class Elaborator(object):
         # statement spans and handled serially below.
         refinfo = dict((n, (len(r.pins), r.pidx)) for n, r in self.lib_refs.items())
         _G["elab"] = (text, prefix, local, refinfo, buses)
-        jobs = self.jobs if (be - bs) > _PAR_ELAB_BYTES else 1
+        jobs = self.jobs if (be - bs) > _PAR_ELAB_BYTES and _HAS_FORK else 1
         ranges = _split_ranges(text, bs, be, jobs * 4 if jobs > 1 else 1)
         if jobs > 1:
             import multiprocessing
@@ -1272,6 +1274,11 @@ class Elaborator(object):
         iname = m.group(2)
         if iname[0] == "\\":
             iname = iname[1:].rstrip()
+        am = re.match(r"^\[\s*(-?\d+)\s*:\s*(-?\d+)\s*\]$", m.group(3) or "")
+        if am:
+            self._inst_array(mod, prefix + iname, int(am.group(1)), int(am.group(2)),
+                             refname, m.group(4), prefix, local, buses, children)
+            return
         if m.group(3):
             iname += m.group(3).replace(" ", "")
         full = prefix + iname
@@ -1335,6 +1342,53 @@ class Elaborator(object):
         d.cell_off.append(len(d.conn))
         if r.kind == REF_MODULE:
             children.append((c, ri))
+
+    def _inst_array(self, mod, base, a, b, refname, body, prefix, local, buses, children):
+        """Instance array  REF u[a:b] (...): one cell per element. A connection
+        whose width is N x pin width is sliced (leftmost element gets the MSBs);
+        a pin-width connection is shared by all elements (Verilog rules)."""
+        d = self.d
+        ri = self.ref_for(refname)
+        r = d.refs[ri]
+        st = -1 if a > b else 1
+        idxs = list(range(a, b + st, st))
+        if not body.lstrip().startswith("."):
+            d.issues.append(("DES-004", "%s[%d:%d]: positional connections on an instance "
+                             "array are not supported; array not elaborated" % (base, a, b)))
+            return
+        conns = []
+        for pin, expr in _RX_NAMED.findall(body):
+            if pin[0] == "\\":
+                pin = pin[1:].rstrip()
+            conns.append((pin, self._bits(expr, prefix, local, buses) if expr.strip() else []))
+        n = len(idxs)
+        for k, ix in enumerate(idxs):
+            full = "%s[%d]" % (base, ix)
+            row = [UNCONN] * len(r.pins)
+            for pin, bits in conns:
+                w = len(r.bus[pin]) if pin in r.bus else 1
+                if len(bits) == w * n and n > 1:
+                    sl = bits[k * w:(k + 1) * w]
+                elif len(bits) in (0, w):
+                    sl = bits
+                else:
+                    if k == 0:
+                        d.issues.append(("DES-004", "%s[%d:%d]: pin %s connected to %d bit(s); "
+                                         "expected %d or %d" % (base, a, b, pin, len(bits), w, w * n)))
+                    sl = bits[-w:]
+                if pin in r.pidx and pin not in r.bus:
+                    if sl:
+                        row[r.pidx[pin]] = sl[-1]
+                else:
+                    self._bus_conn(r, row, pin, sl, full)
+            c = len(d.cell_names)
+            d.cell_names.append(full)
+            d.cell_index[full] = c
+            d.cell_ref.append(ri)
+            d.conn.extend(row)
+            d.cell_off.append(len(d.conn))
+            if r.kind == REF_MODULE:
+                children.append((c, ri))
 
     def _bus_conn(self, r, row, pin, bits, full):
         if pin in r.bus:
@@ -3101,6 +3155,13 @@ class SdcEngine(object):
         cname = ck[0][1] if ck else None
         if "-clock" not in o:
             self.add("IO-004", "%s without -clock (delay not related to any clock)" % rec["cmd"], loc)
+        if rec["dropped"]:
+            return          # OBJ-002 already reported; must not count as applied
+        pins = [self.obj_name(k) for k in rec["objs"] if k[0] == "pin"]
+        if pins:
+            self.add("IO-009", "%s on %d internal pin(s): legal in PrimeTime, but not modelled "
+                     "by sdc_qc (no port coverage credit)" % (rec["cmd"], len(pins)), loc,
+                     obj=" ".join(pins[:self.opts.max_examples]))
         ports, bad = [], []
         for k in rec["objs"]:
             if k[0] == "port":
@@ -3787,7 +3848,14 @@ def write_reports(out_dir, findings, summary):
 
 def parse_mode(spec):
     """'name:VAR=val:a.sdc:b.sdc' -> (name, [('var',VAR,val) | ('sdc',path,None)...])"""
-    parts = [p for p in spec.split(":")]
+    raw = spec.split(":")
+    parts = raw[:1]
+    for p in raw[1:]:
+        # re-join a Windows drive letter: "D" + "\\path" or "/path" -> "D:\\path"
+        if len(parts) > 1 and re.match(r"^[A-Za-z]$", parts[-1]) and p[:1] in ("\\", "/"):
+            parts[-1] += ":" + p
+        else:
+            parts.append(p)
     if len(parts) < 2 or not parts[0]:
         _fatal("ERROR: bad -mode '%s' (expected name[:VAR=value...]:file.sdc[:more.sdc])"
                          % spec)

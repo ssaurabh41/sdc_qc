@@ -276,6 +276,18 @@ class EngineUnitTests(unittest.TestCase):
         self.assertEqual(r["PARSE-001"], 4)
         self.assertEqual(len(e.m.io), 2)              # execution continued after errors
 
+    def test_dropped_io_delay_not_counted(self):     # finding 2
+        e = self.eng("create_clock -name C -period 2 [get_ports clk]\n"
+                     "set_input_delay -clock MISSING 0.2 [get_ports a]\n")
+        self.assertEqual(e.m.io, [])
+        self.assertIn("OBJ-002", [f.rule for f in e.findings])
+
+    def test_pin_io_delay_diagnosed(self):           # finding 3
+        e = self.eng("create_clock -name C -period 2 [get_ports clk]\n"
+                     "set_input_delay -clock C 0.3 [get_pins u_core/q_reg/D]\n")
+        self.assertEqual([f.obj for f in e.findings if f.rule == "IO-009"],
+                         ["u_core/q_reg/D"])
+
     def test_sandbox(self):
         e = self.eng("exec rm -rf /tmp/x\nset f [open /tmp/sdcqc_x w]\n")
         self.assertEqual(sum(1 for f in e.findings if f.rule in ("PARSE-001", "PARSE-002")), 2)
@@ -350,6 +362,46 @@ class ParallelTests(unittest.TestCase):
         _, b = run(modes, extra=["-jobs", "2"])
         key = lambda r: sorted((f["rule"], f["mode"], f["line"], f["msg"]) for f in r["findings"])
         self.assertEqual(key(a), key(b))
+
+
+class Findings1Tests(unittest.TestCase):
+    """Regression tests for the independent review in codex/findings-1."""
+
+    def design(self, text, jobs=1):
+        tmp = tempfile.mkdtemp()
+        try:
+            v = os.path.join(tmp, "t.v")
+            with open(v, "w") as fh:
+                fh.write(text)
+            libs = sdc_qc.load_liberties([D("cells.lib")], 1, None)
+            return sdc_qc.build_design([v], libs, None, [], jobs=jobs)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_instance_array_expanded(self):          # finding 1
+        d = self.design("module t (clk, d, q); input clk; input [3:0] d; output [3:0] q;\n"
+                        "DFFX1 u[3:0] (.CK(clk), .D(d), .Q(q));\nendmodule\n")
+        self.assertEqual(sorted(d.cell_names), ["u[0]", "u[1]", "u[2]", "u[3]"])
+        c = d.cell_index["u[3]"]
+        r = d.refs[d.cell_ref[c]]
+        self.assertEqual(d.net_names[d.slot_net(d.cell_off[c] + r.pidx["D"])], "d[3]")
+        self.assertEqual(d.net_names[d.slot_net(d.cell_off[c] + r.pidx["CK"])], "clk")
+        self.assertEqual(len(sdc_qc.register_clock_slots(d)), 4)
+
+    def test_no_fork_serial_fallback(self):         # finding 5
+        old = (sdc_qc._HAS_FORK, sdc_qc._PAR_ELAB_BYTES)
+        sdc_qc._HAS_FORK, sdc_qc._PAR_ELAB_BYTES = False, 0
+        try:
+            d = self.design("module t (clk, d, q); input clk, d; output q;\n"
+                            "DFFX1 u (.CK(clk), .D(d), .Q(q));\nendmodule\n", jobs=4)
+        finally:
+            sdc_qc._HAS_FORK, sdc_qc._PAR_ELAB_BYTES = old
+        self.assertEqual(d.cell_names, ["u"])
+
+    def test_windows_mode_paths(self):              # finding 4
+        n, s = sdc_qc.parse_mode("m:SDC_MODE=x:D:\\w\\a.sdc:C:/w/b.sdc:/unix/c.sdc")
+        self.assertEqual([x[1] for x in s], ["SDC_MODE", "D:\\w\\a.sdc", "C:/w/b.sdc",
+                                             "/unix/c.sdc"])
 
 
 class ModeSpecTests(unittest.TestCase):

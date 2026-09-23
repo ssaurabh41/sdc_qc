@@ -64,12 +64,14 @@ and `2` means a tool or usage error (missing file, bad option, internal error).
   `-search_path` directories, then the current directory. A missing file is
   reported as `PARSE-004` and the run continues.
 * With `-jobs` > 1, modes run in parallel processes.
+* Windows absolute paths work: a single drive letter followed by `\` or `/`
+  is kept with its path (`func:D:\sdc\a.sdc`). Unix absolute paths are unaffected.
 
 ## Inputs
 
 | Input | Notes |
 |---|---|
-| `-netlist` | One or more `.v` / `.v.gz` files. The top is auto-detected (override with `-top`). Sub-block netlists are elaborated into the hierarchy. |
+| `-netlist` | One or more `.v` / `.v.gz` files. Instance arrays (`FF u[3:0] (...)`) are expanded into one cell per element, with connections sliced or shared by Verilog rules. The top is auto-detected (override with `-top`). Sub-block netlists are elaborated into the hierarchy. |
 | `-lib`, `-lib_list` | `.lib` / `.lib.gz`, CCS/LVF is fine. **One corner is enough**: only pin names, directions, bus types, `function`, `clock`, `ff`/`latch`/`statetable`, ICG attributes and each `timing()` group's `related_pin` / `timing_type` are read. |
 | `-blackbox PATTERN` | A reference with neither a netlist module nor a Liberty cell is reported as `DES-002` ERROR. A matching `-blackbox` glob turns it into an INFO line; the block's pin names are taken from its instance connections. |
 
@@ -122,6 +124,7 @@ Each rule has a default severity; the few downgrades are noted in the table. Che
 | IO-006 | WARNING | I/O delay has `-max` but no `-min` (or vice versa) |
 | IO-007 | WARNING | Input port without driving cell / drive / input transition |
 | IO-008 | WARNING | Output port without `set_load` |
+| IO-009 | INFO | I/O delay on an internal pin (legal, not modelled; gives no port coverage) |
 | EXC-001 | WARNING | `-from` object is not a valid timing startpoint (INFO for `set_max/min_delay`: path segmentation) |
 | EXC-002 | WARNING | `-to` object is not a valid timing endpoint (same) |
 | EXC-003 | WARNING | Setup multicycle without matching hold multicycle |
@@ -210,7 +213,7 @@ How it gets there:
   specification or supported Python reader. Reading it needs a licensed
   Synopsys tool, which defeats a licence-free pre-check. The extract cache
   gives a faster reload than `.db` would.
-* **Netlist:**
+* **Netlist** (parallel elaboration needs `fork`; on Windows it falls back to serial):
   * Declarations are found with `str.find`.
   * Bodies larger than 16 MB are split on `;` boundaries and parsed by forked
     worker processes.
