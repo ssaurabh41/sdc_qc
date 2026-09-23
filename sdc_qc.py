@@ -147,7 +147,7 @@ _LIB_ATTR = re.compile(rb'([A-Za-z_][\w.]*)\s*:\s*("(?:[^"\\]|\\.)*"|[^;{}"]*?)\
 _LIB_CATTR = re.compile(rb"([A-Za-z_]\w*)\s*\(([^(){};]*)\)\s*;")
 _LIB_HDR = re.compile(rb"([A-Za-z_][\w.]*)\s*\(([^(){}]*)\)\s*$")
 _LIB_COMMENT = re.compile(rb"/\*.*?\*/", re.S)
-_LIB_BITSEL = re.compile(r"^(.*?)\[(\d+)(?::(\d+))?\]$")
+_LIB_BITSEL = re.compile(r"^(.*?)\[(-?\d+)(?::(-?\d+))?\]$")
 
 # Parser contexts
 _C_ROOT, _C_LIB, _C_CELL, _C_PIN, _C_BUS, _C_TIMING, _C_TYPE, _C_FF, _C_LATCH = range(9)
@@ -536,6 +536,10 @@ def load_liberties(paths, jobs, cache_dir):
 
 _CONSTRAINT_TT = ("setup_", "hold_", "recovery_", "removal_", "nochange_", "non_seq_",
                   "skew_")
+# subset of _CONSTRAINT_TT whose related_pin is an actual clock; non_seq_* and skew_*
+# check one data/control pin against another (e.g. set-vs-reset pulse ordering), so
+# their related_pin must not be folded into clock_pins.
+_CONSTRAINT_TT_CLOCK = ("setup_", "hold_", "recovery_", "removal_", "nochange_")
 _EDGE_TT = ("rising_edge", "falling_edge")
 _RX_IDENT = re.compile(r"[A-Za-z_][\w\[\]]*")
 
@@ -600,9 +604,10 @@ def ref_from_lib(name, cell, libname):
             if tt.startswith(_CONSTRAINT_TT):
                 endpoint.add(i)
                 has_arc_seq = True
-                for q in rp.split():
-                    if q in r.pidx:
-                        clock.add(r.pidx[q])
+                if tt.startswith(_CONSTRAINT_TT_CLOCK):
+                    for q in rp.split():
+                        if q in r.pidx:
+                            clock.add(r.pidx[q])
             elif tt in _EDGE_TT:
                 has_arc_seq = True
                 for q in rp.split():
@@ -1459,11 +1464,16 @@ def build_design(netlists, libs, top, blackbox, jobs=1):
     lib_refs = {}
     sigs = {}
     tunits, cunits = set(), set()
+    first_tunit = first_cunit = None
     for lib in libs:
         if lib.get("time_unit"):
             tunits.add(lib["time_unit"])
+            if first_tunit is None:
+                first_tunit = lib["time_unit"]
         if lib.get("cap_unit"):
             cunits.add(lib["cap_unit"])
+            if first_cunit is None:
+                first_cunit = lib["cap_unit"]
         for cname, cell in lib["cells"].items():
             if cname in lib_refs:
                 if sigs[cname] != _pin_sig(cell):
@@ -1472,8 +1482,10 @@ def build_design(netlists, libs, top, blackbox, jobs=1):
                 continue
             sigs[cname] = _pin_sig(cell)
             lib_refs[cname] = ref_from_lib(cname, cell, lib["path"])
-    d.time_unit = sorted(tunits)[0] if tunits else None
-    d.cap_unit = sorted(cunits)[0] if cunits else None
+    # On disagreement, use the first library's unit (matches PrimeTime/Innovus,
+    # which take units from the first-read/link Liberty file), not an alphabetic pick.
+    d.time_unit = first_tunit
+    d.cap_unit = first_cunit
     if len(tunits) > 1:
         d.issues.append(("UNIT-002", "Liberty time units differ: %s" % ", ".join(sorted(tunits))))
     if len(cunits) > 1:
