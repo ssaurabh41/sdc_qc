@@ -431,6 +431,16 @@ class Findings1Tests(unittest.TestCase):
                                              "/unix/c.sdc"])
 
 
+class SourceEncodingTests(unittest.TestCase):
+    def test_source_is_pure_ascii(self):
+        """A re-encoded copy (editor ANSI/GBK save) must not break the script:
+        keep sdc_qc.py ASCII-only; use \\uXXXX / HTML entities in the template."""
+        with open(os.path.join(os.path.dirname(HERE), "sdc_qc.py"), "rb") as fh:
+            data = fh.read()
+        bad = [i + 1 for i, l in enumerate(data.split(b"\n")) if any(c > 127 for c in l)]
+        self.assertEqual(bad, [])
+
+
 class ModeSpecTests(unittest.TestCase):
     def test_parse_mode(self):
         n, s = sdc_qc.parse_mode("m1:SDC_MODE=mode1:a.sdc:b.sdc")

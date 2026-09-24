@@ -3858,7 +3858,7 @@ def load_waivers(paths):
     out = []
     for p in paths:
         try:
-            with open(p) as fh:
+            with open(p, encoding="utf-8-sig") as fh:
                 doc = json.load(fh)
         except (IOError, OSError) as e:
             _fatal("ERROR: cannot read -waivers file %s: %s" % (p, e))
@@ -4182,7 +4182,7 @@ header{flex:none;position:relative;display:flex;flex-direction:column;background
       <input id="q" placeholder="Search rule, message, object, file:line     /" autocomplete="off" spellcheck="false">
       <button id="b-clear" class="btn" data-act="clearAll" title="Clear search and all filters (Esc)">Clear all</button>
       <button id="b-hw" class="btn" data-act="hideWaived" title="Hide or show waived findings"></button>
-      <button id="b-bulk" class="btn" data-act="openBulk" title="Waive every unwaived finding in the current view">Waive view…</button>
+      <button id="b-bulk" class="btn" data-act="openBulk" title="Waive every unwaived finding in the current view">Waive view&#8230;</button>
       <button id="b-w" class="btn" data-act="openWaivers" title="Manage waivers, unused and redundant report"></button>
       <button id="b-link" class="btn" data-act="copyLink" title="Copy a link to this exact view" style="margin-left:auto"></button>
       <button id="b-pane" class="btn ib" data-act="pane" title="Detail pane  ]"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"></rect><path d="M15 3v18"></path></svg></button>
@@ -4241,7 +4241,7 @@ var F = (D.findings || []).map(function (f, i) {
   var cat = f.rule.split('-')[0], meta = RULES[f.rule] || [f.sev, f.rule], cross = f.mode === '*', fb = base(f.file);
   var mode = cross ? 'cross-mode' : f.mode;
   return { id: i, rule: f.rule, cat: cat, sev: f.sev, mode: mode, modeList: [mode], file: f.file || '', fileBase: fb, line: f.line || 0,
-    loc: f.file ? fb + (f.line ? ':' + f.line : '') : '—', cmd: f.cmd || '', obj: f.obj || '', objs: f.obj ? String(f.obj).split(/\s+/).filter(Boolean) : [],
+    loc: f.file ? fb + (f.line ? ':' + f.line : '') : '\u2014', cmd: f.cmd || '', obj: f.obj || '', objs: f.obj ? String(f.obj).split(/\s+/).filter(Boolean) : [],
     msg: f.msg || '', title: meta[1], defSev: meta[0], ids: [i], key: 'f' + i,
     hay: (f.rule + ' ' + (f.msg || '') + ' ' + (f.cmd || '') + ' ' + (f.obj || '') + ' ' + fb + ':' + (f.line || '') + ' ' + mode).toLowerCase() };
 });
@@ -4490,7 +4490,7 @@ function renderFacets(v) {
     ['Severity', 'sev', SEVS.map(function (s) { return item('sev', s, SL[s], count(function (x) { return x.sev === s; }), { fill: col(s), idle: tint(s) }); })],
     ['Mode', 'mode', modeKeys.map(function (k) { return item('mode', k, k, count(function (x) { return x.modeList.indexOf(k) >= 0; })); })],
     ['Category', 'cat', catKeys.map(function (c) { return item('cat', c, CATS[c] || c, count(function (x) { return x.cat === c; })); })],
-    ['Rule', 'rule', ruleList.map(function (r) { return item('rule', r.rule, r.rule, count(function (x) { return x.rule === r.rule; }), { mono: true, fill: col(r.sev), title: r.rule + ' · ' + r.title }); })]
+    ['Rule', 'rule', ruleList.map(function (r) { return item('rule', r.rule, r.rule, count(function (x) { return x.rule === r.rule; }), { mono: true, fill: col(r.sev), title: r.rule + ' \u00b7 ' + r.title }); })]
   ];
   $('facets').innerHTML = groups.map(function (g) {
     return '<div class="fg"><div class="fgt"><span>' + g[0] + '</span>' + (has(f[g[1]]) ? '<button class="lnk" data-act="clearDim" data-dim="' + g[1] + '">clear</button>' : '') + '</div>' + g[2].join('') + '</div>';
@@ -4503,7 +4503,7 @@ function rowHtml(x, style) {
     '<span class="c c-sev" style="color:' + colT(x.sev) + '"><span class="dot" style="background:' + col(x.sev) + '"></span>' + SL[x.sev] + '</span>' +
     '<span class="c c-rule">' + h(x.rule) + '</span>' +
     '<span class="c c-mode" title="' + h(x.modeList.join(', ')) + '">' + h(modeText(x)) + '</span>' +
-    (cfg.loc ? (x.file ? '<a class="c c-loc" ' + linkAttrs(x) + ' title="' + h(x.file) + '">' + h(x.loc) + '</a>' : '<span class="c c-loc" style="color:var(--faint)">—</span>') : '') +
+    (cfg.loc ? (x.file ? '<a class="c c-loc" ' + linkAttrs(x) + ' title="' + h(x.file) + '">' + h(x.loc) + '</a>' : '<span class="c c-loc" style="color:var(--faint)">\u2014</span>') : '') +
     '<span class="c-msgw">' + (x.wv ? '<span class="wtag" title="' + h(x.wv.id) + '">WAIVED</span>' : '') + '<span class="c c-msg" title="' + h(x.msg) + '">' + h(x.msg) + '</span></span></div>';
 }
 var rowH = 0, winRange = null;
@@ -4512,7 +4512,7 @@ function listFooter() {
   var out = '';
   if (!V.list.length) out += '<div class="empty">Nothing matches the current filters.</div>';
   if (!st.showAll && V.hasOver)
-    out += '<div class="over"><span>Not shown (row limit): ' + SEVS.filter(function (k) { return V.over[k]; }).map(function (k) { return fmt(V.over[k]) + ' ' + SL[k]; }).join(' · ') +
+    out += '<div class="over"><span>Not shown (row limit): ' + SEVS.filter(function (k) { return V.over[k]; }).map(function (k) { return fmt(V.over[k]) + ' ' + SL[k]; }).join(' \u00b7 ') +
       '</span><button class="lnk" data-act="showAll">Show all</button></div>';
   return out;
 }
@@ -4534,7 +4534,7 @@ function renderTable() {
   th.style.gridTemplateColumns = cols();
   th.innerHTML = [['sev', 'Sev'], ['rule', 'Rule'], ['mode', cfg.group ? 'Modes' : 'Mode'], ['loc', 'Location'], ['msg', 'Message']]
     .filter(function (c) { return cfg.loc || c[0] !== 'loc'; })
-    .map(function (c) { return '<button class="' + (st.sort === c[0] ? 'on' : '') + '" data-act="sort" data-k="' + c[0] + '">' + c[1] + (st.sort === c[0] ? (st.dir > 0 ? ' ↓' : ' ↑') : '') + '</button>'; }).join('');
+    .map(function (c) { return '<button class="' + (st.sort === c[0] ? 'on' : '') + '" data-act="sort" data-k="' + c[0] + '">' + c[1] + (st.sort === c[0] ? (st.dir > 0 ? ' \u2193' : ' \u2191') : '') + '</button>'; }).join('');
   rowH = 0; renderRows(true);
 }
 
@@ -4561,10 +4561,10 @@ function renderPane(v, W) {
   var o = [];
   o.push('<div class="dp"><div class="dh"><span class="stag" title="' + (changed ? 'default ' + SL[x.defSev] : 'Default severity ' + SL[x.defSev]) + '" style="background:' + tint(x.sev) + ';color:' + colT(x.sev) + '">' + SL[x.sev] + '</span>' +
     '<span class="mono" style="font-size:12px;font-weight:600">' + h(x.rule) + '</span><span style="font-size:11.5px;color:var(--faint)">' + h(CATS[x.cat] || x.cat) + '</span>' +
-    (changed ? '<span style="font-size:11px;color:var(--faint)">· default ' + SL[x.defSev] + '</span>' : '') + '</div>');
+    (changed ? '<span style="font-size:11px;color:var(--faint)">\u00b7 default ' + SL[x.defSev] + '</span>' : '') + '</div>');
   o.push('<div style="display:flex;flex-direction:column;gap:3px"><div class="dtitle">' + h(x.title) + '</div><div class="dmsg">' + h(x.msg) + '</div></div>');
   o.push('<div class="kv"><span class="k">File</span><div style="display:flex;flex-direction:column;gap:1px;min-width:0">' +
-    (x.file ? '<a class="mono" style="font-size:12px;color:var(--accent-t);text-decoration:none" ' + linkAttrs(x) + ' title="' + (cfg.open === 'vscode' ? 'Open in VS Code' : cfg.open === 'copy' ? 'Copy path' : 'Open file') + '">' + h(x.loc) + '</a>' : '<span class="mono" style="font-size:12px">—</span>') +
+    (x.file ? '<a class="mono" style="font-size:12px;color:var(--accent-t);text-decoration:none" ' + linkAttrs(x) + ' title="' + (cfg.open === 'vscode' ? 'Open in VS Code' : cfg.open === 'copy' ? 'Copy path' : 'Open file') + '">' + h(x.loc) + '</a>' : '<span class="mono" style="font-size:12px">\u2014</span>') +
     '<span class="mono" style="font-size:10.5px;color:var(--faint);word-break:break-all">' + h(x.file || 'No source line (design-level or cross-mode check)') + '</span></div>' +
     '<span class="k">Modes</span><div class="pills">' + modeKeys.map(function (k) {
       return aff[k] ? '<span class="mp" style="background:' + tint(x.sev) + ';color:' + colT(x.sev) + ';border-color:' + col(x.sev) + '">' + h(k) + '</span>' : '<span class="mp">' + h(k) + '</span>';
@@ -4575,7 +4575,7 @@ function renderPane(v, W) {
   o.push('<div class="acts"><button class="hov" data-act="copyLoc">' + (st.copied ? 'Copied' : 'Copy file:line') + '</button><button class="hov" data-act="sameRule">Filter to ' + h(x.rule) + '</button></div>');
   o.push('<div class="wsec"><div class="k">Waiver</div>');
   if (wv) {
-    var meta = [wv.author, wv.created, wv.batch ? 'bulk ' + wv.batch : null].filter(Boolean).join(' · ') || 'no author';
+    var meta = [wv.author, wv.created, wv.batch ? 'bulk ' + wv.batch : null].filter(Boolean).join(' \u00b7 ') || 'no author';
     o.push('<div class="wcard"><div class="a"><span class="mono" style="font-weight:600">' + h(wv.id) + '</span><span style="color:var(--muted)">' + h(SCOPES[wv.scope] || 'Custom match') + '</span></div>' +
       (wv.reason ? '<div style="font-size:12.5px;line-height:1.4">' + h(wv.reason) + '</div>' : '') +
       '<div class="m"><span>' + h(meta) + '</span><button class="lnk" data-act="unwaive" data-id="' + h(wv.id) + '">Remove</button></div></div>');
@@ -4623,8 +4623,8 @@ function bulkSets() {
 function statusRows(W) {
   return WL.map(function (w, i) {
     var target = w.scope === 'rule' ? 'Rule everywhere' : w.scope === 'file' ? 'Rule in ' + (w.file || 'design checks') :
-      [w.file || 'design', w.obj].filter(Boolean).join(' · ') + (w.msg ? ' · exact message' : '');
-    if (w.modes && w.modes.length) target += ' · modes ' + w.modes.join(', ');
+      [w.file || 'design', w.obj].filter(Boolean).join(' \u00b7 ') + (w.msg ? ' \u00b7 exact message' : '');
+    if (w.modes && w.modes.length) target += ' \u00b7 modes ' + w.modes.join(', ');
     return { w: w, target: target, n: W.m[i].length, k: W.status[i] };
   });
 }
@@ -4652,15 +4652,15 @@ function renderDlg(W) {
     }).join('') + '</div>' +
     '<button class="b28 hov" style="margin-left:auto" data-act="exportW">Export</button>' +
     '<label class="b28 hov">Import<input type="file" accept=".json,application/json" data-act="importW" style="display:none"></label>' +
-    '<button class="b28 hov" style="width:28px;padding:0;justify-content:center;font-size:15px" title="Close" data-act="closeDlg">×</button></div>' +
-    '<div class="wg hd"><span>ID</span><span>Rule</span><span>Scope · reason</span><span style="text-align:right">Matches</span><span>Status</span><span></span></div>' +
+    '<button class="b28 hov" style="width:28px;padding:0;justify-content:center;font-size:15px" title="Close" data-act="closeDlg">\u00d7</button></div>' +
+    '<div class="wg hd"><span>ID</span><span>Rule</span><span>Scope \u00b7 reason</span><span style="text-align:right">Matches</span><span>Status</span><span></span></div>' +
     '<div style="flex:1;min-height:0;overflow-y:auto">' + list.map(function (r) {
       return '<div class="wg"><span class="mono" style="font-size:11.5px">' + h(r.w.id) + '</span><span class="mono" style="font-size:11.5px">' + h(r.w.rule) + '</span>' +
-        '<span class="tt"><span title="' + h(r.target) + '">' + h(r.target) + '</span><span title="' + h(r.w.reason || '') + '">' + h(r.w.reason || '—') + '</span></span>' +
+        '<span class="tt"><span title="' + h(r.target) + '">' + h(r.target) + '</span><span title="' + h(r.w.reason || '') + '">' + h(r.w.reason || '\u2014') + '</span></span>' +
         '<span class="mono" style="text-align:right;font-size:11.5px">' + r.n + '</span><span><span class="st st-' + r.k + '">' + ST[r.k] + '</span></span>' +
-        '<button class="xb" title="Remove waiver" data-act="unwaive" data-id="' + h(r.w.id) + '">×</button></div>';
+        '<button class="xb" title="Remove waiver" data-act="unwaive" data-id="' + h(r.w.id) + '">\u00d7</button></div>';
     }).join('') +
-    (list.length ? '' : '<div style="padding:22px 14px;color:var(--muted)">' + (tab === 'all' ? 'No waivers yet. Waive a finding from the detail pane, or use Waive view… for the current filter.' : 'None.') + '</div>') + '</div>' +
+    (list.length ? '' : '<div style="padding:22px 14px;color:var(--muted)">' + (tab === 'all' ? 'No waivers yet. Waive a finding from the detail pane, or use Waive view\u2026 for the current filter.' : 'None.') + '</div>') + '</div>' +
     '<div class="dwf"><span style="flex:1;min-width:0">' + h(st.note || 'Unused: matches nothing in this run. Redundant: everything it matches is already covered by a broader or earlier waiver.') + '</span>' +
     '<button class="b28 hov"' + (W.nUnused ? '' : ' style="opacity:.45"') + ' data-act="rmStatus" data-k="unused">Remove unused (' + W.nUnused + ')</button>' +
     '<button class="b28 hov"' + (W.nRedundant ? '' : ' style="opacity:.45"') + ' data-act="rmStatus" data-k="redundant">Remove redundant (' + W.nRedundant + ')</button></div></div>';
@@ -4720,7 +4720,7 @@ function importW(input) {
       if (!byId[id]) { added++; order.push(id); }
       byId[id] = Object.assign({}, w, { id: id });
     });
-    st.note = 'Imported ' + inc.length + ' (' + added + ' new)' + (doc.top && doc.top !== TOP ? ' · warning: file is for top ' + doc.top : '');
+    st.note = 'Imported ' + inc.length + ' (' + added + ' new)' + (doc.top && doc.top !== TOP ? ' \u00b7 warning: file is for top ' + doc.top : '');
     setW(order.map(function (id) { return byId[id]; }));
   };
   rd.readAsText(file);
@@ -4838,7 +4838,7 @@ document.addEventListener('mousedown', function (e) {
 window.addEventListener('hashchange', function () { readHash(); render(); });
 window.addEventListener('resize', function () { if (winRange) renderRows(false); });
 
-document.title = 'sdc_qc · ' + TOP;
+document.title = 'sdc_qc \u00b7 ' + TOP;
 readHash();
 render();
 })();
@@ -4878,7 +4878,7 @@ def write_reports(out_dir, findings, summary, waivers=(), wstatus=(), sources=No
                 short_name[p] = tail
 
     import csv
-    with open(os.path.join(out_dir, "sdc_qc.csv"), "w") as fh:
+    with open(os.path.join(out_dir, "sdc_qc.csv"), "w", encoding="utf-8", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["rule", "severity", "mode", "file", "line", "command", "objects", "message",
                     "waiver"])
@@ -4890,7 +4890,7 @@ def write_reports(out_dir, findings, summary, waivers=(), wstatus=(), sources=No
         ("waivers", list(waivers))])
     if sources is not None:
         doc["sources"] = sources
-    with open(os.path.join(out_dir, "sdc_qc.json"), "w") as fh:
+    with open(os.path.join(out_dir, "sdc_qc.json"), "w", encoding="utf-8") as fh:
         json.dump(doc, fh, indent=1)
     if html:
         write_html(os.path.join(out_dir, "sdc_qc.html"), doc, fonts_url)
@@ -4968,7 +4968,7 @@ def write_reports(out_dir, findings, summary, waivers=(), wstatus=(), sources=No
                 L.append("        reason: %s" % w["reason"])
     L.append("")
     L.append("Timing (s): " + ", ".join("%s=%.1f" % kv for kv in summary["timing"].items()))
-    with open(os.path.join(out_dir, "sdc_qc.rpt"), "w") as fh:
+    with open(os.path.join(out_dir, "sdc_qc.rpt"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(L) + "\n")
 
 
@@ -5097,7 +5097,7 @@ def main(argv=None):
     for lf in opts.lib_list:
         if not os.path.isfile(lf):
             _fatal("ERROR: -lib_list file not found: %s" % lf)
-        with open(lf) as fh:
+        with open(lf, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 line = line.split("#", 1)[0].strip()
                 if line:
