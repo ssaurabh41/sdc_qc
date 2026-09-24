@@ -506,6 +506,12 @@ class WaiverTests(unittest.TestCase):
         self.assertNotIn("<", data)
         self.assertEqual(json.loads(data)["findings"], res["findings"])
         self.assertIn(D("foo.nondft.sdc"), json.loads(data)["sources"])
+        # file:// links need absolute paths (relative/symlinked SDC paths broke them)
+        absmap = json.loads(data)["abs"]
+        self.assertTrue(absmap)
+        for rel, ab in absmap.items():
+            self.assertTrue(os.path.isabs(ab))
+            self.assertEqual(ab, os.path.abspath(rel))
 
     def test_matching_and_status(self):
         today = sdc_qc._utc_today()

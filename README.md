@@ -69,8 +69,11 @@ the left, the findings table in the middle, and a detail pane on the right with
 the SDC source excerpt and waiver controls. Identical findings across modes are
 grouped into one row. Keys: `j`/`k` move, `/` searches, `]` toggles the pane,
 `Esc` clears. The view (search, filters, sort, selection) is kept in the URL, so
-**Copy link** shares an exact view. Settings (theme, density, row limits, how file
-links open, author) are remembered per browser.
+**Copy link** shares an exact view. Settings (theme, text size, row limits, how file
+links open, author) are remembered per browser. Defaults: large text, Location
+column shown, long messages and locations wrapped, wide filter and detail panes.
+Location links open the SDC by its absolute path (a relative or symlinked
+`-mode` path works).
 
 Waivers created in the page are kept in the browser. Use **Waivers → Export** to
 save them as `<top>.sdc_qc.waivers.json`, then pass that file back:
